@@ -15,7 +15,7 @@ fi
 apt-get update -y
 apt-get install -y unzip inotify-tools rsync curl
 
-# Install .NET 8 runtime (Ubuntu path)
+# Install .NET 8 runtime if missing (framework-dependent deploy target)
 if ! command -v dotnet >/dev/null 2>&1; then
   if [[ "$OS" == "ubuntu" ]]; then
     wget -O /tmp/msprod.deb https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
@@ -33,7 +33,7 @@ touch /etc/dotnet-apps/ports.map
 chmod 664 /etc/dotnet-apps/ports.map
 
 # -------------------------
-# systemd template (per-app)
+# systemd template (no WorkingDirectory here; set per-app via override)
 # -------------------------
 cat >/etc/systemd/system/dotnet-app@.service <<'UNIT'
 [Unit]
@@ -42,7 +42,7 @@ After=network.target
 
 [Service]
 EnvironmentFile=-/etc/dotnet-apps/%i.env
-WorkingDirectory=${WORKING_DIR}
+# WorkingDirectory is set per-app in /etc/systemd/system/dotnet-app@<app>.service.d/override.conf
 ExecStart=/usr/bin/dotnet ${WORKING_DIR}/${EXEC_DLL}
 Restart=always
 RestartSec=5
@@ -55,11 +55,11 @@ WantedBy=multi-user.target
 UNIT
 
 # -------------------------
-# autodeployer
-# scans /home/*/public_html/.dotnet
-# syncs to /home/<domain>/dotnet/current
-# assigns port, writes env, adds OLS proxy rules,
-# (re)starts dotnet-app@<key>
+# Auto-deployer
+# - finds /home/*/public_html/.dotnet
+# - syncs to /home/<domain>/dotnet/current
+# - assigns port, writes env, writes systemd override WorkingDirectory=<absolute path>
+# - restarts dotnet-app@<key>
 # -------------------------
 cat >/usr/local/bin/dotnet-autodeploy <<'SCRIPT'
 #!/usr/bin/env bash
@@ -106,6 +106,7 @@ deploy_one(){
   local key
   key="$(echo "$domain" | tr "." "_" | tr '[:upper:]' '[:lower:]')"
 
+  # dll: prefer DLL= from marker; otherwise first *.dll in public_html
   local dll
   dll="$(grep -E '^DLL=' "$marker" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
   if [[ -z "$dll" ]]; then
@@ -120,7 +121,7 @@ deploy_one(){
   local current="${appdir}/current"
   mkdir -p "$current"
 
-  # Sync publish files (skip our markers)
+  # Sync publish files (skip markers)
   rsync -a --delete --exclude='.htaccess' --exclude='.dotnet' "$root"/ "$current"/
 
   chown -R www-data:www-data "$appdir"
@@ -135,6 +136,13 @@ ASPNETCORE_URLS=http://127.0.0.1:${port}
 ASPNETCORE_ENVIRONMENT=Production
 WORKING_DIR=${current}
 EXEC_DLL=${dll}
+EOF
+
+  # Per-app override with absolute WorkingDirectory
+  mkdir -p "/etc/systemd/system/dotnet-app@${key}.service.d"
+  cat >"/etc/systemd/system/dotnet-app@${key}.service.d/override.conf" <<EOF
+[Service]
+WorkingDirectory=${current}
 EOF
 
   ensure_rules "$domain" "$port"
@@ -188,7 +196,7 @@ cat >/usr/local/bin/cyberpanel-dotnet <<'CLI'
 set -euo pipefail
 
 usage(){ cat <<U
-cyberpanel-dotnet v1.0
+cyberpanel-dotnet v1.1
 Usage:
   cyberpanel-dotnet enable <domain> [--dll Main.dll]
   cyberpanel-dotnet redeploy

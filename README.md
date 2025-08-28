@@ -16,22 +16,31 @@ curl -fsSL https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main/in
 
 ## 📦 Deploy your .NET app
 
-1. **Publish on your dev machine**
+1. **Check which .NET runtime is installed on your server**
+   ```bash
+   dotnet --list-runtimes
+   ```
+   Example output:
+   ```
+   Microsoft.NETCore.App 8.0.19 [/usr/share/dotnet/shared/Microsoft.NETCore.App]
+   ```
+   In this case, you should build with **net8.0**.
+
+   > ⚠️ Important: Always publish your app with the **same version** installed on your server.  
+   > We recommend **.NET 8 (LTS)** for new projects, but confirm your server version before publishing.
+
+2. **Publish on your dev machine**
    ```bash
    dotnet publish -c Release -o publish
    ```
    This creates a `publish/` folder containing `YourApp.dll` and supporting files.
-   > Ensure your project targets **.NET 8.0** in the `.csproj`:
-   > ```xml
-   > <TargetFramework>net8.0</TargetFramework>
-   > ```
 
-2. **Upload to the server** (same place as PHP sites)
+3. **Upload to the server** (same place as PHP sites)
    ```
    /home/<your-domain>/public_html/
    ```
 
-3. **Enable .NET for the site**
+4. **Enable .NET for the site**
    ```bash
    sudo cyberpanel-dotnet enable <your-domain> --dll YourApp.dll
    ```
@@ -40,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main/in
    sudo cyberpanel-dotnet enable flezora.com --dll WebRTCVideoCall.dll
    ```
 
-4. **Open your site**
+5. **Open your site**
    ```
    https://<your-domain>/
    ```
@@ -135,8 +144,6 @@ sudo cyberpanel-dotnet redeploy
 - **Find app port**
   ```bash
   sudo cyberpanel-dotnet port flezora.com
-  # or:
-  sudo awk -F= '/ASPNETCORE_URLS/{print $2}' /etc/dotnet-apps/flezora_com.env | awk -F: '{print $3}'
   ```
 
 - **Check environment (port, paths)**

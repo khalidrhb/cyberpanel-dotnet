@@ -7,7 +7,7 @@ Make ASP.NET Core deploy like PHP on CyberPanel: upload your published files to 
 Replace `YOURORG` with your GitHub username or org:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOURORG/cyberpanel-dotnet/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main/install.sh | sudo bash
 ```
 
 ## Author

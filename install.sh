@@ -15,15 +15,18 @@ fi
 apt-get update -y
 apt-get install -y unzip inotify-tools rsync curl
 
-# Install .NET 8 runtime if missing (framework-dependent deploy target)
+# Install .NET runtime if missing (framework-dependent deploy)
 if ! command -v dotnet >/dev/null 2>&1; then
   if [[ "$OS" == "ubuntu" ]]; then
-    wget -O /tmp/msprod.deb https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
+    . /etc/os-release
+    CODENAME="${VERSION_CODENAME:-jammy}"
+    # Fallback to 22.04 feed which covers jammy/noble broadly
+    curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -o /tmp/msprod.deb
     dpkg -i /tmp/msprod.deb
     apt-get update -y
     apt-get install -y aspnetcore-runtime-8.0
   else
-    echo "[error] Please install .NET 8 runtime for your distro, then re-run."
+    echo "[error] Please install .NET runtime for your distro, then re-run."
     exit 1
   fi
 fi
@@ -32,221 +35,28 @@ mkdir -p /etc/dotnet-apps
 touch /etc/dotnet-apps/ports.map
 chmod 664 /etc/dotnet-apps/ports.map
 
-# -------------------------
-# systemd template (no WorkingDirectory here; set per-app via override)
-# -------------------------
-cat >/etc/systemd/system/dotnet-app@.service <<'UNIT'
-[Unit]
-Description=.NET App %i
-After=network.target
+# --- Install scripts from repo (avoids heredoc/newline corruption) ---
+RAW_BASE="https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main"
 
-[Service]
-EnvironmentFile=-/etc/dotnet-apps/%i.env
-# WorkingDirectory is set per-app in /etc/systemd/system/dotnet-app@<app>.service.d/override.conf
-ExecStart=/usr/bin/dotnet ${WORKING_DIR}/${EXEC_DLL}
-Restart=always
-RestartSec=5
-User=www-data
-Group=www-data
-SyslogIdentifier=%i
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# -------------------------
-# Auto-deployer
-# - finds /home/*/public_html/.dotnet
-# - syncs to /home/<domain>/dotnet/current
-# - assigns port, writes env, writes systemd override WorkingDirectory=<absolute path>
-# - restarts dotnet-app@<key>
-# -------------------------
-cat >/usr/local/bin/dotnet-autodeploy <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-PORTS=/etc/dotnet-apps/ports.map
-
-reserve_port(){
-  local key="$1"
-  if grep -q "^${key}:" "$PORTS" 2>/dev/null; then
-    awk -F: -v k="$key" '$1==k{print $2}' "$PORTS"
-    return
-  fi
-  local port=51000
-  local used="$(awk -F: '{print $2}' "$PORTS" 2>/dev/null | sort -n || true)"
-  while echo "$used" | grep -qx "$port"; do port=$((port+1)); done
-  echo "${key}:${port}" >> "$PORTS"
-  echo "$port"
+install_bin(){
+  local src="$1" dst="$2"
+  curl -fsSL "$RAW_BASE/$src" -o "$dst"
+  chmod +x "$dst"
 }
 
-ensure_rules(){
-  local domain="$1" port="$2"
-  local docroot="/home/${domain}/public_html"
-  local ht="${docroot}/.htaccess"
-  mkdir -p "$docroot"
-  if ! grep -q "# dotnet-autoproxy" "$ht" 2>/dev/null; then
-    cat >>"$ht" <<EOF
-
-# dotnet-autoproxy
-RewriteEngine On
-RewriteCond %{HTTP:Upgrade} =websocket [NC]
-RewriteRule /(.*) ws://127.0.0.1:${port}/$1 [P,L]
-RewriteRule ^(.*)$ http://127.0.0.1:${port}$1 [P,L]
-EOF
-  fi
+install_unit(){
+  local src="$1" dst="$2"
+  curl -fsSL "$RAW_BASE/$src" -o "$dst"
+  chmod 0644 "$dst"
 }
 
-deploy_one(){
-  local domain="$1"
-  local root="/home/${domain}/public_html"
-  local marker="${root}/.dotnet"
-  [[ -f "$marker" ]] || return 0
+install_bin "scripts/cyberpanel-dotnet"   "/usr/local/bin/cyberpanel-dotnet"
+install_bin "scripts/dotnet-autodeploy"   "/usr/local/bin/dotnet-autodeploy"
 
-  local key
-  key="$(echo "$domain" | tr "." "_" | tr '[:upper:]' '[:lower:]')"
+install_unit "systemd/dotnet-app@.service"        "/etc/systemd/system/dotnet-app@.service"
+install_unit "systemd/dotnet-autodeploy.service"  "/etc/systemd/system/dotnet-autodeploy.service"
+install_unit "systemd/dotnet-autodeploy.timer"    "/etc/systemd/system/dotnet-autodeploy.timer"
 
-  # dll: prefer DLL= from marker; otherwise first *.dll in public_html
-  local dll
-  dll="$(grep -E '^DLL=' "$marker" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
-  if [[ -z "$dll" ]]; then
-    dll="$(find "$root" -maxdepth 1 -type f -name '*.dll' | head -n1 | xargs -r -n1 basename)"
-  fi
-  if [[ -z "$dll" ]]; then
-    echo "[warn] $domain: no DLL in public_html; upload publish output." >&2
-    return 0
-  fi
-
-  local appdir="/home/${domain}/dotnet"
-  local current="${appdir}/current"
-  mkdir -p "$current"
-
-  # Sync publish files (skip markers)
-  rsync -a --delete --exclude='.htaccess' --exclude='.dotnet' "$root"/ "$current"/
-
-  chown -R www-data:www-data "$appdir"
-  chmod -R 775 "$appdir"
-
-  local port
-  port="$(reserve_port "$key")"
-
-  mkdir -p /etc/dotnet-apps
-  cat >"/etc/dotnet-apps/${key}.env" <<EOF
-ASPNETCORE_URLS=http://127.0.0.1:${port}
-ASPNETCORE_ENVIRONMENT=Production
-WORKING_DIR=${current}
-EXEC_DLL=${dll}
-EOF
-
-  # Per-app override with absolute WorkingDirectory
-  mkdir -p "/etc/systemd/system/dotnet-app@${key}.service.d"
-  cat >"/etc/systemd/system/dotnet-app@${key}.service.d/override.conf" <<EOF
-[Service]
-WorkingDirectory=${current}
-EOF
-
-  ensure_rules "$domain" "$port"
-
-  systemctl daemon-reload
-  systemctl enable "dotnet-app@${key}" >/dev/null 2>&1 || true
-  systemctl restart "dotnet-app@${key}" || true
-
-  echo "[ok] ${domain} -> ${dll} on 127.0.0.1:${port}"
-}
-
-shopt -s nullglob
-for marker in /home/*/public_html/.dotnet; do
-  domain="$(echo "$marker" | awk -F/ '{print $3}')"
-  deploy_one "$domain"
-done
-SCRIPT
-chmod +x /usr/local/bin/dotnet-autodeploy
-
-# -------------------------
-# timer: run every 30s
-# -------------------------
-cat >/etc/systemd/system/dotnet-autodeploy.service <<'SVC'
-[Unit]
-Description=Auto-deploy .NET apps from public_html
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/dotnet-autodeploy
-SVC
-
-cat >/etc/systemd/system/dotnet-autodeploy.timer <<'TMR'
-[Unit]
-Description=Run .NET auto-deployer every 30s
-
-[Timer]
-OnBootSec=10s
-OnUnitActiveSec=30s
-AccuracySec=5s
-Unit=dotnet-autodeploy.service
-
-[Install]
-WantedBy=timers.target
-TMR
-
-# -------------------------
-# CLI wrapper
-# -------------------------
-cat >/usr/local/bin/cyberpanel-dotnet <<'CLI'
-#!/usr/bin/env bash
-set -euo pipefail
-
-usage(){ cat <<U
-cyberpanel-dotnet v1.1
-Usage:
-  cyberpanel-dotnet enable <domain> [--dll Main.dll]
-  cyberpanel-dotnet redeploy
-  cyberpanel-dotnet status <domain>
-  cyberpanel-dotnet logs <domain>
-  cyberpanel-dotnet disable <domain>
-U
-}
-
-key(){ echo "$1" | tr "." "_" | tr '[:upper:]' '[:lower:]'; }
-
-cmd="${1:-}"; shift || true
-case "$cmd" in
-  enable)
-    dom="${1:-}"; shift || true
-    [[ -n "$dom" ]] || { usage; exit 1; }
-    dll=""
-    if [[ "${1:-}" == "--dll" ]]; then dll="${2:-}"; fi
-    root="/home/${dom}/public_html"
-    mkdir -p "$root"
-    { [[ -n "$dll" ]] && echo "DLL=$dll" || true; } > "$root/.dotnet"
-    systemctl start dotnet-autodeploy.service || true
-    echo "[ok] Enable .NET for $dom"
-    ;;
-  redeploy)
-    systemctl start dotnet-autodeploy.service
-    ;;
-  status)
-    dom="${1:-}"; [[ -n "$dom" ]] || { usage; exit 1; }
-    systemctl status "dotnet-app@$(key "$dom")"
-    ;;
-  logs)
-    dom="${1:-}"; [[ -n "$dom" ]] || { usage; exit 1; }
-    journalctl -u "dotnet-app@$(key "$dom")" -f
-    ;;
-  disable)
-    dom="${1:-}"; [[ -n "$dom" ]] || { usage; exit 1; }
-    systemctl stop "dotnet-app@$(key "$dom")" || true
-    systemctl disable "dotnet-app@$(key "$dom")" || true
-    echo "[ok] Disabled $dom"
-    ;;
-  *)
-    usage; exit 1;;
-esac
-CLI
-chmod +x /usr/local/bin/cyberpanel-dotnet
-
-# -------------------------
-# finish
-# -------------------------
 systemctl daemon-reload
 systemctl enable --now dotnet-autodeploy.timer
 

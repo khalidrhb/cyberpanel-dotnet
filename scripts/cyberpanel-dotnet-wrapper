@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/cyberpanel-dotnet-wrapper
+# Wraps the real CLI so `enable <domain> --dll <Entry.dll>` also wires OLS.
 set -euo pipefail
 REAL="/usr/local/bin/cyberpanel-dotnet-real"
 

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# scripts/cyberpanel-dotnet-proxy
+# Usage: sudo cyberpanel-dotnet-proxy <domain> <port>
+set -euo pipefail
+DOMAIN="${1:-}"; PORT="${2:-}"
+[[ -n "$DOMAIN" && -n "$PORT" ]] || { echo "Usage: $0 <domain> <port>"; exit 1; }
+
+LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
+VHCONF="$LSWS_ROOT/conf/vhosts/$DOMAIN/vhconf.conf"
+EXT="dotnet_${DOMAIN//[^a-zA-Z0-9]/_}"
+
+[[ -f "$VHCONF" ]] || { echo "vhost config not found: $VHCONF"; exit 1; }
+sudo cp -a "$VHCONF" "$VHCONF.bak.$(date +%Y%m%d-%H%M%S)"
+
+upsert() {
+  local FILE="$1" BEGIN="$2" END="$3" CONTENT="$4"
+  sudo awk -v b="$BEGIN" -v e="$END" -v c="$CONTENT" '
+    BEGIN{in=0; f=0}
+    $0 ~ b {print c; in=1; f=1; next}
+    $0 ~ e {in=0; next}
+    in==1 {next}
+    {print}
+    END{if(f==0) print c}
+  ' "$FILE" > "${FILE}.tmp" && sudo mv "${FILE}.tmp" "$FILE"
+}
+
+# 1) extprocessor
+EXT_BEGIN="# BEGIN: auto-dotnet-extprocessor $EXT"
+EXT_END="# END: auto-dotnet-extprocessor $EXT"
+read -r -d '' EXT_BLOCK <<EOF || true
+$EXT_BEGIN
+extprocessor $EXT {
+  type                    proxy
+  address                 127.0.0.1:$PORT
+  maxConns                100
+  initTimeout             60
+  retryTimeout            0
+  pcKeepAliveTimeout      120
+}
+$EXT_END
+EOF
+upsert "$VHCONF" "$EXT_BEGIN" "$EXT_END" "$EXT_BLOCK"
+
+# 2) proxy context /
+CTX_BEGIN="# BEGIN: auto-dotnet-context-$EXT"
+CTX_END="# END: auto-dotnet-context-$EXT"
+read -r -d '' CTX_BLOCK <<EOF || true
+$CTX_BEGIN
+context / {
+  type                    proxy
+  handler                 $EXT
+  addDefaultCharset       off
+}
+$CTX_END
+EOF
+upsert "$VHCONF" "$CTX_BEGIN" "$CTX_END" "$CTX_BLOCK"
+
+# 3) WebSocket upgrade (SignalR)
+RWT_BEGIN="# BEGIN: auto-dotnet-websocket-$EXT"
+RWT_END="# END: auto-dotnet-websocket-$EXT"
+read -r -d '' RWT_BLOCK <<EOF || true
+$RWT_BEGIN
+rewrite  {
+  enable                  1
+  rewriteCond             %{HTTP:Upgrade} =websocket [NC]
+  rewriteRule             /(.*) ws://127.0.0.1:$PORT/\$1 [P,L]
+}
+$RWT_END
+EOF
+upsert "$VHCONF" "$RWT_BEGIN" "$RWT_END" "$RWT_BLOCK"
+
+sudo systemctl restart lsws
+echo "OK: OLS wired for $DOMAIN → 127.0.0.1:$PORT"

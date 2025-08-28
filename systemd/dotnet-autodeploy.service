@@ -1,0 +1,6 @@
+[Unit]
+Description=Auto-deploy .NET apps from public_html
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dotnet-autodeploy

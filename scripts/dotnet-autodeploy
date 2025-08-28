@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORTS=/etc/dotnet-apps/ports.map
+
+reserve_port(){
+  local key="$1"
+  if grep -q "^${key}:" "$PORTS" 2>/dev/null; then
+    awk -F: -v k="$key" '$1==k{print $2}' "$PORTS"
+    return
+  fi
+  local port=51000
+  local used="$(awk -F: '{print $2}' "$PORTS" 2>/dev/null | sort -n || true)"
+  while echo "$used" | grep -qx "$port"; do port=$((port+1)); done
+  echo "${key}:${port}" >> "$PORTS"
+  echo "$port"
+}
+
+ensure_rules(){
+  local domain="$1" port="$2"
+  local docroot="/home/${domain}/public_html"
+  local ht="${docroot}/.htaccess"
+  mkdir -p "$docroot"
+  if ! grep -q "# dotnet-autoproxy" "$ht" 2>/dev/null; then
+    cat >>"$ht" <<EOF
+
+# dotnet-autoproxy
+RewriteEngine On
+RewriteCond %{HTTP:Upgrade} =websocket [NC]
+RewriteRule /(.*) ws://127.0.0.1:${port}/$1 [P,L]
+RewriteRule ^(.*)$ http://127.0.0.1:${port}$1 [P,L]
+EOF
+  fi
+}
+
+deploy_one(){
+  local domain="$1"
+  local root="/home/${domain}/public_html"
+  local marker="${root}/.dotnet"
+  [[ -f "$marker" ]] || return 0
+
+  local key
+  key="$(echo "$domain" | tr "." "_" | tr '[:upper:]' '[:lower:]')"
+
+  local dll
+  dll="$(grep -E '^DLL=' "$marker" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  if [[ -z "$dll" ]]; then
+    dll="$(find "$root" -maxdepth 1 -type f -name '*.dll' | head -n1 | xargs -r -n1 basename)"
+  fi
+  if [[ -z "$dll" ]]; then
+    echo "[warn] $domain: no DLL in public_html; upload publish output." >&2
+    return 0
+  fi
+
+  local appdir="/home/${domain}/dotnet"
+  local current="${appdir}/current"
+  mkdir -p "$current"
+
+  rsync -a --delete --exclude='.htaccess' --exclude='.dotnet' "$root"/ "$current"/
+
+  chown -R www-data:www-data "$appdir"
+  chmod -R 775 "$appdir"
+
+  local port
+  port="$(reserve_port "$key")"
+
+  mkdir -p /etc/dotnet-apps
+  cat >"/etc/dotnet-apps/${key}.env" <<EOF
+ASPNETCORE_URLS=http://127.0.0.1:${port}
+ASPNETCORE_ENVIRONMENT=Production
+WORKING_DIR=${current}
+EXEC_DLL=${dll}
+EOF
+
+  # Per-app override with absolute WorkingDirectory
+  mkdir -p "/etc/systemd/system/dotnet-app@${key}.service.d"
+  cat >"/etc/systemd/system/dotnet-app@${key}.service.d/override.conf" <<EOF
+[Service]
+WorkingDirectory=${current}
+EOF
+
+  ensure_rules "$domain" "$port"
+
+  systemctl daemon-reload
+  systemctl enable "dotnet-app@${key}" >/dev/null 2>&1 || true
+  systemctl restart "dotnet-app@${key}" || true
+
+  echo "[ok] ${domain} -> ${dll} on 127.0.0.1:${port}"
+}
+
+shopt -s nullglob
+mkdir -p /etc/dotnet-apps
+touch /etc/dotnet-apps/ports.map
+chmod 664 /etc/dotnet-apps/ports.map
+
+for marker in /home/*/public_html/.dotnet; do
+  domain="$(echo "$marker" | awk -F/ '{print $3}')"
+  deploy_one "$domain"
+done

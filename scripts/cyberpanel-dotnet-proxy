@@ -1,15 +1,50 @@
 #!/usr/bin/env bash
-# scripts/cyberpanel-dotnet-proxy
 # Usage: sudo cyberpanel-dotnet-proxy <domain> <port>
+# Auto-detects vhost folder/file, creates/updates:
+#   - extprocessor (proxy → 127.0.0.1:<port>)
+#   - proxy context /
+#   - WebSocket upgrade rule (SignalR)
 set -euo pipefail
+
 DOMAIN="${1:-}"; PORT="${2:-}"
 [[ -n "$DOMAIN" && -n "$PORT" ]] || { echo "Usage: $0 <domain> <port>"; exit 1; }
 
 LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
-VHCONF="$LSWS_ROOT/conf/vhosts/$DOMAIN/vhconf.conf"
-EXT="dotnet_${DOMAIN//[^a-zA-Z0-9]/_}"
 
-[[ -f "$VHCONF" ]] || { echo "vhost config not found: $VHCONF"; exit 1; }
+# --- auto-detect vhost dir/file for this domain ---
+# Try exact dir, then any prefix match (domain-443, domain_SSL, etc.), prefer SSL one if multiple.
+pick_vhconf() {
+  local candidates=()
+  local base="$LSWS_ROOT/conf/vhosts"
+
+  [[ -d "$base" ]] || return 1
+
+  # exact match first
+  [[ -d "$base/$DOMAIN" ]] && candidates+=("$base/$DOMAIN")
+
+  # any dir starting with the domain
+  while IFS= read -r -d '' d; do candidates+=("$d"); done < <(find "$base" -maxdepth 1 -type d -name "$DOMAIN*" -print0 2>/dev/null || true)
+
+  # prefer SSL/443 variants when multiple exist
+  local picked=""
+  for d in "${candidates[@]}"; do
+    [[ -f "$d/vhconf.conf" ]] && picked="$d/vhconf.conf" && break
+    [[ -f "$d/vhost.conf" ]] && picked="$d/vhost.conf" && break
+  done
+  # second pass, bias SSL-ish names
+  if [[ -z "$picked" && ${#candidates[@]} -gt 0 ]]; then
+    for d in "${candidates[@]}"; do
+      [[ "$d" =~ 443|SSL|ssl ]] && { [[ -f "$d/vhconf.conf" ]] && picked="$d/vhconf.conf"; [[ -z "$picked" && -f "$d/vhost.conf" ]] && picked="$d/vhost.conf"; [[ -n "$picked" ]] && break; }
+    done
+  fi
+
+  [[ -n "$picked" ]] && echo "$picked" || return 1
+}
+
+VHCONF="$(pick_vhconf || true)"
+[[ -n "$VHCONF" ]] || { echo "vhost config not found for $DOMAIN under $LSWS_ROOT/conf/vhosts"; exit 1; }
+
+EXT="dotnet_${DOMAIN//[^a-zA-Z0-9]/_}"
 sudo cp -a "$VHCONF" "$VHCONF.bak.$(date +%Y%m%d-%H%M%S)"
 
 upsert() {
@@ -70,4 +105,4 @@ EOF
 upsert "$VHCONF" "$RWT_BEGIN" "$RWT_END" "$RWT_BLOCK"
 
 sudo systemctl restart lsws
-echo "OK: OLS wired for $DOMAIN → 127.0.0.1:$PORT"
+echo "OK: OLS wired for $DOMAIN → 127.0.0.1:$PORT via $VHCONF"

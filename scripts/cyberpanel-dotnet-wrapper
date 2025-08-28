@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# scripts/cyberpanel-dotnet-wrapper
+set -euo pipefail
+REAL="/usr/local/bin/cyberpanel-dotnet-real"
+
+if [[ "${1:-}" == "enable" && $# -ge 4 ]]; then
+  DOMAIN="$2"
+  "$REAL" "$@"   # run the real enable
+  PORT="$(sudo "$REAL" port "$DOMAIN" | tr -d '\r\n')"
+  [[ -n "$PORT" ]] || { echo "ERROR: could not determine port for $DOMAIN"; exit 1; }
+  sudo /usr/local/bin/cyberpanel-dotnet-proxy "$DOMAIN" "$PORT"
+  exit 0
+fi
+
+exec "$REAL" "$@"

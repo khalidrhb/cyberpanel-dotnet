@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: sudo cyberpanel-dotnet-proxy <domain> <port>
-# Auto-detects vhost folder/file, creates/updates:
+# Creates/updates:
 #   - extprocessor (proxy → 127.0.0.1:<port>)
 #   - proxy context /
 #   - WebSocket upgrade rule (SignalR)
@@ -12,29 +12,32 @@ DOMAIN="${1:-}"; PORT="${2:-}"
 LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
 
 # --- auto-detect vhost dir/file for this domain ---
-# Try exact dir, then any prefix match (domain-443, domain_SSL, etc.), prefer SSL one if multiple.
 pick_vhconf() {
-  local candidates=()
   local base="$LSWS_ROOT/conf/vhosts"
+  local candidates=()
 
   [[ -d "$base" ]] || return 1
 
   # exact match first
   [[ -d "$base/$DOMAIN" ]] && candidates+=("$base/$DOMAIN")
 
-  # any dir starting with the domain
-  while IFS= read -r -d '' d; do candidates+=("$d"); done < <(find "$base" -maxdepth 1 -type d -name "$DOMAIN*" -print0 2>/dev/null || true)
+  # any dir starting with the domain (domain-443, domain_SSL, etc.)
+  while IFS= read -r -d '' d; do candidates+=("$d"); done \
+    < <(find "$base" -maxdepth 1 -type d -name "$DOMAIN*" -print0 2>/dev/null || true)
 
-  # prefer SSL/443 variants when multiple exist
+  # first pass: first existing conf in discovered dirs
   local picked=""
   for d in "${candidates[@]}"; do
     [[ -f "$d/vhconf.conf" ]] && picked="$d/vhconf.conf" && break
     [[ -f "$d/vhost.conf" ]] && picked="$d/vhost.conf" && break
   done
-  # second pass, bias SSL-ish names
+
+  # second pass: bias SSL/443 variants if none picked yet
   if [[ -z "$picked" && ${#candidates[@]} -gt 0 ]]; then
     for d in "${candidates[@]}"; do
-      [[ "$d" =~ 443|SSL|ssl ]] && { [[ -f "$d/vhconf.conf" ]] && picked="$d/vhconf.conf"; [[ -z "$picked" && -f "$d/vhost.conf" ]] && picked="$d/vhost.conf"; [[ -n "$picked" ]] && break; }
+      [[ "$d" =~ 443|SSL|ssl ]] || continue
+      [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
+      [[ -f "$d/vhost.conf" ]] && { picked="$d/vhost.conf"; break; }
     done
   fi
 
@@ -50,12 +53,12 @@ sudo cp -a "$VHCONF" "$VHCONF.bak.$(date +%Y%m%d-%H%M%S)"
 upsert() {
   local FILE="$1" BEGIN="$2" END="$3" CONTENT="$4"
   sudo awk -v b="$BEGIN" -v e="$END" -v c="$CONTENT" '
-    BEGIN{in=0; f=0}
-    $0 ~ b {print c; in=1; f=1; next}
-    $0 ~ e {in=0; next}
-    in==1 {next}
+    BEGIN{inblk=0; found=0}
+    $0 ~ b {print c; inblk=1; found=1; next}
+    $0 ~ e {inblk=0; next}
+    inblk==1 {next}
     {print}
-    END{if(f==0) print c}
+    END{if(found==0) print c}
   ' "$FILE" > "${FILE}.tmp" && sudo mv "${FILE}.tmp" "$FILE"
 }
 

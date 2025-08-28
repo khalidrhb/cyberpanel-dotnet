@@ -97,3 +97,5 @@ echo
 echo "==> Auto-proxy enabled:"
 echo "    sudo cyberpanel-dotnet enable <domain> --dll YourApp.dll"
 echo "    (This also wires OpenLiteSpeed: extprocessor + proxy / + WebSocket, then restarts lsws.)"
+
+

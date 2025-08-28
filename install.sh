@@ -65,3 +65,17 @@ echo "==> Installed. Deploy .NET like PHP:"
 echo " 1) dotnet publish -c Release -o publish"
 echo " 2) Upload publish/* to /home/<domain>/public_html/"
 echo " 3) sudo cyberpanel-dotnet enable <domain> --dll YourApp.dll"
+
+
+# Install OLS proxy helper and wrapper
+install_bin "scripts/cyberpanel-dotnet-proxy" "/usr/local/bin/cyberpanel-dotnet-proxy"
+
+# Wrap the main CLI so `enable` also wires OLS automatically
+if [[ -f /usr/local/bin/cyberpanel-dotnet ]]; then
+  mv /usr/local/bin/cyberpanel-dotnet /usr/local/bin/cyberpanel-dotnet-real
+  install_bin "scripts/cyberpanel-dotnet-wrapper" "/usr/local/bin/cyberpanel-dotnet"
+fi
+
+echo
+echo "==> Auto-proxy enabled: 'cyberpanel-dotnet enable <domain> --dll YourApp.dll'"
+echo "    will also wire OpenLiteSpeed (proxy + WebSocket) and restart lsws."

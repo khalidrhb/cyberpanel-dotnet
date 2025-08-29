@@ -1,0 +1,4 @@
+# Enforce LF endings so bash scripts never ship CRLF
+*.sh                 text eol=lf
+scripts/*            text eol=lf
+systemd/*            text eol=lf

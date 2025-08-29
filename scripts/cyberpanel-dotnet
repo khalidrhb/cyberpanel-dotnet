@@ -47,11 +47,35 @@ _detect_lsws_root(){
 
 trim_slash(){ local p="${1:-}"; p="${p%/}"; echo "$p"; }
 
+# Expand $VH_ROOT/$SERVER_ROOT/$VH_NAME inside a vhost conf
+_expand_vars(){
+  local raw="${1:-}" vhconf="${2:-}"
+  local vhroot="" vhname="" serverroot="$LSWS_ROOT"
+
+  # derive vhost name from path .../vhosts/<name>/vhconf.conf
+  vhname="$(basename "$(dirname "$vhconf")")"
+
+  # get vhRoot if present
+  vhroot="$(awk '/^[[:space:]]*vhRoot[[:space:]]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
+  vhroot="${vhroot%\"}"; vhroot="${vhroot#\"}"
+
+  # replace known vars
+  raw="${raw//\$VH_ROOT/$vhroot}"
+  raw="${raw//\$SERVER_ROOT/$serverroot}"
+  raw="${raw//\$VH_NAME/$vhname}"
+  echo "$raw"
+}
+
+# Resolve docRoot from a vhconf, expanding variables
 docroot_from_vhconf(){
   local vhconf="$1"
-  local dr; dr=$(awk '/^\s*docRoot\s+/{print $2; exit}' "$vhconf" 2>/dev/null || true)
+  local dr; dr="$(awk '/^[[:space:]]*docRoot[[:space:]]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
   dr="${dr%\"}"; dr="${dr#\"}"
-  [[ -n "$dr" ]] && trim_slash "$dr" && return 0
+  [[ -z "$dr" ]] && return 1
+  dr="$(_expand_vars "$dr" "$vhconf")"
+  dr="${dr%\"}"; dr="${dr#\"}"
+  dr="$(trim_slash "$dr")"
+  [[ -n "$dr" ]] && echo "$dr" && return 0
   return 1
 }
 
@@ -62,6 +86,7 @@ _vhname_from_map(){
   shopt -s nullglob
   while IFS= read -r -d '' f; do
     while IFS= read -r line; do
+      # lines like: map   myVHost   flezora.com,www.flezora.com  (or space/comma separated)
       echo "$line" | grep -qi -- "$domain" || continue
       name=$(awk 'BEGIN{IGNORECASE=1}
         /^[[:space:]]*map[[:space:]]+/ {
@@ -80,17 +105,18 @@ _vhname_from_map(){
 # Robust vhost finder (safe for set -u):
 #  1) exact folder match: $VHOSTS_DIR/<domain>/vhconf.conf
 #  2) listener map lines -> vhost name
-#  3) search by docRoot == /home/<domain>/public_html across $VHOSTS_DIR and $CONF_DIR
+#  3) search by docRoot == /home/<domain>/public_html (expands $VH_ROOT etc.) across $VHOSTS_DIR + $CONF_DIR
 #  4) docRoot contains the domain AND ends with public_html
 #  5) path contains the domain
-#  6) manual override via 2nd param
+#  6) final heuristic: if exactly 1 non-Example vhost exists, use it
+#  7) manual override via 2nd param
 vhconf_for(){
   local domain="$1"
   local override="${2:-}"
   if [[ -n "$override" && -f "$override" ]]; then echo "$override"; return; fi
 
-  local candidate=""
-  local exact_dr; exact_dr=$(trim_slash "/home/$domain/public_html")
+  local candidate="" exact_dr hit_sub="" hit_path=""
+  exact_dr="$(trim_slash "/home/$domain/public_html")"
 
   # 1) exact folder match
   candidate="$VHOSTS_DIR/$domain/vhconf.conf"
@@ -98,27 +124,30 @@ vhconf_for(){
 
   # 2) listener map -> vhName
   local vhname=""
-  if vhname=$(_vhname_from_map "$domain" || true); then
+  if vhname="$(_vhname_from_map "$domain" || true)"; then
     if [[ -n "$vhname" ]]; then
       candidate="$VHOSTS_DIR/$vhname/vhconf.conf"
       if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
     fi
   fi
 
-  # 3,4,5) scan for docRoot or path matches
-  local d="" f="" dr="" hit_sub="" hit_path=""
+  # 3/4/5) scan all vhconfs
+  local d f dr
   for d in "$VHOSTS_DIR" "$CONF_DIR"; do
     [[ -d "$d" ]] || continue
     while IFS= read -r -d '' f; do
-      dr=$(docroot_from_vhconf "$f" || true)
+      dr="$(docroot_from_vhconf "$f" || true)"
+      # exact match of expanded docRoot
       if [[ -n "$dr" && "$(trim_slash "$dr")" == "$exact_dr" ]]; then
         echo "$f"; return
       fi
+      # loose: expanded docRoot mentions domain + public_html
       if [[ -z "$hit_sub" && -n "$dr" ]]; then
         if echo "$dr" | grep -qiE "/${domain}(/|.*)public_html/?$"; then
           hit_sub="$f"
         fi
       fi
+      # path contains domain
       if [[ -z "$hit_path" ]]; then
         if echo "$f" | grep -qi "/${domain}.*vhconf\.conf$"; then
           hit_path="$f"
@@ -129,6 +158,14 @@ vhconf_for(){
 
   if [[ -n "$hit_sub" ]]; then echo "$hit_sub"; return; fi
   if [[ -n "$hit_path" ]]; then echo "$hit_path"; return; fi
+
+  # 6) heuristic: if there is exactly 1 non-Example vhost, use it
+  local one="" count=0
+  while IFS= read -r f; do
+    [[ "$f" == *"/Example/"* ]] && continue
+    count=$((count+1)); one="$f"
+  done < <(find "$VHOSTS_DIR" -maxdepth 2 -type f -name 'vhconf.conf' 2>/dev/null)
+  if (( count == 1 )); then echo "$one"; return; fi
 
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR or $CONF_DIR.
 Hints:
@@ -178,7 +215,7 @@ resolve_dll_from_marker(){
 resolve_dll(){
   local workdir="$1"; local dll="${2:-}"
   if [[ -z "$dll" ]]; then
-    if dll=$(resolve_dll_from_marker "$workdir"); then :; else err "--dll <App.dll> is required (or put DLL=YourApp.dll into $workdir/.dotnet)"; fi
+    if dll=$(resolve_dll_from_marker "$workdir"); then :; else err "--dll <App.dll> is required (or put DLL=YourApp.dll)"; fi
   fi
   if [[ "$dll" = /* && -f "$dll" ]]; then echo "$dll"; return; fi
   if [[ -f "$workdir/$dll" ]]; then echo "$workdir/$dll"; return; fi
@@ -225,244 +262,4 @@ remove_proxy_context(){
 
 # ---------- systemd ----------
 create_service(){
-  local domain="$1" workdir="$2" port="$3" absdll="$4"; local svc="$(service_path "$domain")"
-  local id; id=$(sanitize_id "$domain")
-  local user; user=$(stat -c '%U' "$workdir" 2>/dev/null || echo "nobody")
-  local envfile; envfile=$(envfile_path "$domain")
-  cat >"$envfile" <<ENV
-DOMAIN=$domain
-DOCROOT=$workdir
-PORT=$port
-DLL_PATH=$absdll
-ENV
-  cat >"$svc" <<UNIT
-[Unit]
-Description=CyberPanel .NET App for $domain (port $port)
-After=network.target
-
-[Service]
-Type=simple
-User=$user
-Group=$user
-WorkingDirectory=$workdir
-EnvironmentFile=$envfile
-ExecStart=/usr/local/bin/cyberpanel-dotnet-wrapper
-Restart=always
-RestartSec=5
-KillSignal=SIGINT
-SyslogIdentifier=dotnet-$(sanitize_id "$domain")
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-}
-
-# ---------- Preflight ----------
-autodetect(){
-  sudo_ok
-  need awk; need sed; need ss; need find; need grep
-  local dot; dot=$(find_dotnet) || err "dotnet runtime not found. Install .NET (e.g., apt install dotnet-runtime-8.0) and retry."
-  LSWS_ROOT=$(_detect_lsws_root) || err "OpenLiteSpeed not found. Install CyberPanel/OpenLiteSpeed first."
-  VHOSTS_DIR="$LSWS_ROOT/conf/vhosts"
-  CONF_DIR="$LSWS_ROOT/conf"
-  [[ -d "$CONF_DIR" ]] || err "OpenLiteSpeed conf directory missing at $CONF_DIR."
-  [[ -d "$SYSTEMD_DIR" && -w "$SYSTEMD_DIR" ]] || err "Systemd directory $SYSTEMD_DIR not writable."
-}
-
-preflight_domain(){
-  local domain="$1" vh_override="${2:-}"
-  [[ -n "$domain" ]] || err "Domain is required"
-  local vh; vh=$(vhconf_for "$domain" "$vh_override") || exit 1
-  [[ -f "$vh" ]] || err "vhconf not found for $domain"
-  local wd; wd=$(workdir_for_domain "$domain" "$vh_override") || exit 1
-  [[ -d "$wd" ]] || err "Document root '$wd' does not exist for $domain"
-}
-
-# ---------- Commands ----------
-usage(){ cat <<USAGE
-cyberpanel-dotnet — manage .NET apps on CyberPanel/OpenLiteSpeed
-
-Commands:
-  enable  <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]
-  redeploy [<domain>]
-  status  <domain>
-  logs    <domain> [--lines N|-n N] [-f]
-  port    <domain>
-  disable <domain> [--vhconf /path/to/vhconf.conf]
-  remove  <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]
-  list
-  check   <domain> [--vhconf /path/to/vhconf.conf]
-  help
-USAGE
-}
-
-list_domains(){ ls -1 $SYSTEMD_DIR/dotnet-app@*.service 2>/dev/null | sed -E 's#.*/dotnet-app@([^/]+)\.service#\1#' | tr '_' '.' | sort || true; }
-
-cmd_check(){
-  local domain="$1"; shift || true
-  local vh_override=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --vhconf) vh_override="$2"; shift 2;;
-      *) shift;;
-    esac
-  done
-  autodetect; preflight_domain "$domain" "$vh_override"
-  local vh=$(vhconf_for "$domain" "$vh_override")
-  local wd=$(workdir_for_domain "$domain" "$vh_override")
-  echo "LSWS_ROOT=$LSWS_ROOT"
-  echo "VHOSTS_DIR=$VHOSTS_DIR"
-  echo "CONF_DIR=$CONF_DIR"
-  echo "VHCONF=$vh"
-  echo "DOCROOT=$wd"
-  if p=$(get_port_from_service "$domain" 2>/dev/null); then echo "PORT=$p"; else echo "PORT=(not assigned yet)"; fi
-}
-
-cmd_enable(){
-  local domain="$1"; shift || true
-  local dll=""; local port=""; local vh_override=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --dll) dll="$2"; shift 2;;
-      --port) port="$2"; shift 2;;
-      --vhconf) vh_override="$2"; shift 2;;
-      *) err "Unknown flag: $1";;
-    esac
-  done
-
-  autodetect; preflight_domain "$domain" "$vh_override"
-  local vh=$(vhconf_for "$domain" "$vh_override")
-  local wd=$(workdir_for_domain "$domain" "$vh_override")
-  local dll_path; dll_path=$(resolve_dll "$wd" "$dll")
-  if [[ -z "$port" ]]; then port=$(alloc_port "$domain"); else [[ "$port" =~ ^[0-9]+$ ]] || err "--port must be a number"; fi
-
-  create_service "$domain" "$wd" "$port" "$dll_path"
-  systemctl daemon-reload
-  systemctl enable --now "$(service_name "$domain")"
-  inject_proxy_context "$vh" "$port"
-  ols_reload
-
-  local unit; unit=$(service_name "$domain")
-  local envf; envf=$(envfile_path "$domain")
-
-  grn "✅ Enabled $domain"
-  cat <<MSG
-------------------------------------------------------------
-Public URL:    http(s)://$domain
-Reverse proxy: ADDED in $vh (OpenLiteSpeed) [cyberpanel-dotnet markers]
-Internal URL:  http://127.0.0.1:$port  (Kestrel)
-Systemd unit:  $unit
-Env file:      $envf
-
-Next steps:
- • Open your site:   https://$domain   (if SSL is configured in CyberPanel)
- • Live logs:        journalctl -u $unit -f
- • Redeploy now:     sudo cyberpanel-dotnet redeploy $domain
- • Check detected:   sudo cyberpanel-dotnet check $domain
-------------------------------------------------------------
-MSG
-}
-
-cmd_redeploy(){
-  autodetect
-  local domain="${1:-}"
-  if [[ -z "$domain" ]]; then
-    for unit in $SYSTEMD_DIR/dotnet-app@*.service; do
-      [[ -f "$unit" ]] || continue
-      local name; name=$(basename "$unit" .service)
-      systemctl restart "$name" || true
-    done
-    grn "Redeployed all managed .NET apps."
-  else
-    systemctl restart "$(service_name "$domain")"
-    grn "Redeployed $domain"
-  fi
-}
-
-cmd_status(){ autodetect; local domain="$1"; [[ -n "$domain" ]] || err "Domain required"; systemctl status "$(service_name "$domain")"; }
-
-cmd_logs(){
-  autodetect
-  local domain="$1"; shift || true
-  [[ -n "$domain" ]] || err "Domain required"
-  local lines=""; local follow=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -f|--follow) follow="-f"; shift;;
-      --lines|-n) lines="-n ${2:-200}"; shift 2;;
-      *) shift;;
-    esac
-  done
-  journalctl -u "$(service_name "$domain")" $lines $follow
-}
-
-cmd_port(){
-  autodetect; local domain="$1"; [[ -n "$domain" ]] || err "Domain required";
-  if ! p=$(get_port_from_service "$domain"); then err "No port assigned yet. Run 'enable' first."; fi
-  echo "$p"
-}
-
-remove_proxy_for(){
-  local domain="$1" vh_override="${2:-}"
-  local vh=$(vhconf_for "$domain" "$vh_override")
-  remove_proxy_context "$vh" || true
-  ols_reload || true
-}
-
-cmd_disable(){
-  autodetect; local domain="$1"; shift || true
-  local vh_override=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --vhconf) vh_override="$2"; shift 2;;
-      *) shift;;
-    esac
-  done
-  systemctl stop "$(service_name "$domain")" || true
-  remove_proxy_for "$domain" "$vh_override"
-  grn "Disabled $domain (service stopped, proxy removed)"
-}
-
-cmd_remove(){
-  autodetect; local domain="$1"; shift || true
-  [[ -n "$domain" ]] || err "Domain required"
-  local purge=0; local vh_override=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --purge-runtime) purge=1; shift;;
-      --vhconf) vh_override="$2"; shift 2;;
-      *) err "Unknown flag: $1";;
-    esac
-  done
-  systemctl stop "$(service_name "$domain")" || true
-  systemctl disable "$(service_name "$domain")" || true
-  rm -f "$(service_path "$domain")"
-  rm -f "$(envfile_path "$domain")"
-  systemctl daemon-reload || true
-  remove_proxy_for "$domain" "$vh_override"
-  if (( purge == 1 )); then
-    local rt="/home/$domain/dotnet"
-    [[ -d "$rt" ]] && rm -rf "$rt"
-    info "Purged $rt (if existed)."
-  fi
-  grn "Removed $domain (service + proxy)."
-}
-
-# ---------- Entry ----------
-main(){
-  local cmd="${1:-}"; shift || true
-  case "$cmd" in
-    enable)      [[ $# -ge 1 ]] || err "Usage: enable <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]"; cmd_enable "$@";;
-    redeploy)    cmd_redeploy "$@";;
-    status)      [[ $# -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
-    logs)        [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
-    port)        [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
-    disable)     [[ $# -ge 1 ]] || err "Usage: disable <domain> [--vhconf /path/to/vhconf.conf]"; cmd_disable "$@";;
-    remove)      [[ $# -ge 1 ]] || err "Usage: remove <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]"; cmd_remove "$@";;
-    list)        list_domains;;
-    check)       [[ $# -ge 1 ]] || err "Usage: check <domain> [--vhconf /path/to/vhconf.conf]"; cmd_check "$@";;
-    help|--help|-h|"") usage;;
-    *) err "Unknown command: $cmd";;
-  esac
-}
-main "$@"
+  local domain="$1" workdir="$2" port="$3" absdll="$4"; l

@@ -407,14 +407,29 @@ cmd_enable(){
   done
 
   autodetect; preflight_domain "$domain" "$vh_override"
+
   local vh; vh="$(vhconf_for "$domain" "$vh_override")"
   local wd; wd="$(workdir_for_domain "$domain" "$vh_override")"
-  local dll_path; dll_path="$(resolve_dll "$wd" "$dll")"
-  if [[ -z "$port" ]]; then port="$(alloc_port "$domain")"; else [[ "$port" =~ ^[0-9]+$ ]] || err "--port must be a number"; fi
 
+  # Reuse existing port if service already exists and --port not supplied
+  local existing_port=""
+  if existing_port="$(get_port_from_service "$domain" 2>/dev/null || true)"; then
+    if [[ -z "${port:-}" || ! "$port" =~ ^[0-9]+$ ]]; then
+      port="$existing_port"
+    fi
+  fi
+  # If still empty, allocate a new one
+  if [[ -z "${port:-}" ]]; then port="$(alloc_port "$domain")"; else [[ "$port" =~ ^[0-9]+$ ]] || err "--port must be a number"; fi
+
+  local dll_path; dll_path="$(resolve_dll "$wd" "$dll")"
+
+  # Write/update service + env; always restart to pick up changes
   create_service "$domain" "$wd" "$port" "$dll_path"
   systemctl daemon-reload
-  systemctl enable --now "$(service_name "$domain")"
+  systemctl enable "$(service_name "$domain")"
+  systemctl restart "$(service_name "$domain")"
+
+  # Update reverse proxy to chosen port and reload OLS
   inject_proxy_context "$vh" "$port"
   ols_reload
 
@@ -540,7 +555,7 @@ main(){
   case "$cmd" in
     enable)      [[ $# -ge 1 ]] || err "Usage: enable <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]"; cmd_enable "$@";;
     redeploy)    cmd_redeploy "$@";;
-    status)      [[ $# -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
+    status)      [[ # -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
     logs)        [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
     port)        [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
     disable)     [[ $# -ge 1 ]] || err "Usage: disable <domain> [--vhconf /path/to/vhconf.conf]"; cmd_disable "$@";;

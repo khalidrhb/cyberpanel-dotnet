@@ -22,13 +22,12 @@ fetch_raw(){
 }
 
 normalize_unix(){
-  # Strip CRLF; ensure newline at EOF
   sed -i 's/\r$//' "$1" || true
+  # ensure newline at EOF
   tail -c1 "$1" | read -r _ || echo >> "$1"
 }
 
 maybe_shell_check(){
-  # Only syntax-check our shell scripts
   case "$1" in
     */cyberpanel-dotnet|*/cyberpanel-dotnet-proxy|*/cyberpanel-dotnet-wrapper|*/dotnet-autodeploy)
       bash -n "$1" || { echo "[ERROR] Shell syntax check failed for $1" >&2; exit 1; }

@@ -95,13 +95,13 @@ _vhname_from_map(){
   return 1
 }
 
-# Robust vhost finder (safe for set -u):
+# Robust vhost finder:
 #  1) exact folder match: $VHOSTS_DIR/<domain>/vhconf.conf
 #  2) listener map lines -> vhost name
-#  3) search by docRoot == /home/<domain>/public_html (expands $VH_ROOT etc.) across $VHOSTS_DIR + $CONF_DIR
+#  3) docRoot == /home/<domain>/public_html (after expanding $VH_ROOT etc.)
 #  4) docRoot contains the domain AND ends with public_html
 #  5) path contains the domain
-#  6) final heuristic: if exactly 1 non-Example vhost exists, use it
+#  6) if only 1 non-Example vhost exists, use it
 #  7) manual override via 2nd param
 vhconf_for(){
   local domain="$1"
@@ -111,11 +111,9 @@ vhconf_for(){
   local candidate="" exact_dr="" hit_sub="" hit_path=""
   exact_dr="$(trim_slash "/home/$domain/public_html")"
 
-  # 1) exact folder match
   candidate="$VHOSTS_DIR/$domain/vhconf.conf"
   if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
 
-  # 2) listener map -> vhName
   local vhname=""
   if vhname="$(_vhname_from_map "$domain" || true)"; then
     if [[ -n "$vhname" ]]; then
@@ -124,23 +122,19 @@ vhconf_for(){
     fi
   fi
 
-  # 3/4/5) scan all vhconfs
   local d="" f="" dr=""
   for d in "$VHOSTS_DIR" "$CONF_DIR"; do
     [[ -d "$d" ]] || continue
     while IFS= read -r -d '' f; do
       dr="$(docroot_from_vhconf "$f" || true)"
-      # exact match of expanded docRoot
       if [[ -n "$dr" && "$(trim_slash "$dr")" == "$exact_dr" ]]; then
         echo "$f"; return
       fi
-      # loose: expanded docRoot mentions domain + public_html
       if [[ -z "$hit_sub" && -n "$dr" ]]; then
         if echo "$dr" | grep -qiE "/${domain}(/|.*)public_html/?$"; then
           hit_sub="$f"
         fi
       fi
-      # path contains domain
       if [[ -z "$hit_path" ]]; then
         if echo "$f" | grep -qi "/${domain}.*vhconf\.conf$"; then
           hit_path="$f"
@@ -152,7 +146,6 @@ vhconf_for(){
   if [[ -n "$hit_sub" ]]; then echo "$hit_sub"; return; fi
   if [[ -n "$hit_path" ]]; then echo "$hit_path"; return; fi
 
-  # 6) heuristic: if there is exactly 1 non-Example vhost, use it
   local one="" count=0
   while IFS= read -r one; do
     [[ "$one" == *"/Example/"* ]] && continue
@@ -258,10 +251,8 @@ inject_proxy_context(){
   [[ -f "$vhconf" ]] || err "vhconf missing: $vhconf"
   cp -a "$vhconf" "$vhconf.bak.$(date +%s)"
 
-  # 1) Remove any existing root context blocks
-  remove_root_contexts "$vhconf"
+  remove_root_contexts "$vhconf"   # remove any existing root contexts
 
-  # 2) Remove any previous managed block
   local tmp; tmp="$(mktemp)"
   awk -v B="$MARK_BEGIN" -v E="$MARK_END" '
     BEGIN{del=0}
@@ -271,7 +262,6 @@ inject_proxy_context(){
   ' "$vhconf" > "$tmp"
   mv "$tmp" "$vhconf"
 
-  # 3) Append our managed proxy root context
   cat >>"$vhconf" <<EOF
 $MARK_BEGIN
 context / {
@@ -423,13 +413,11 @@ cmd_enable(){
 
   local dll_path; dll_path="$(resolve_dll "$wd" "$dll")"
 
-  # Write/update service + env; always restart to pick up changes
   create_service "$domain" "$wd" "$port" "$dll_path"
   systemctl daemon-reload
   systemctl enable "$(service_name "$domain")"
   systemctl restart "$(service_name "$domain")"
 
-  # Update reverse proxy to chosen port and reload OLS
   inject_proxy_context "$vh" "$port"
   ols_reload
 
@@ -567,5 +555,3 @@ main(){
   esac
 }
 main "$@"
-
-

@@ -177,10 +177,25 @@ workdir_for_domain(){
 find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
 
 get_port_from_service(){
-  local svc_path; svc_path="$(service_path "$1")"
-  [[ -f "$svc_path" ]] || return 1
-  grep -E '^Environment=PORT=' "$svc_path" | sed -E 's/.*PORT=([0-9]+).*/\1/' | tail -n1 || \
-  grep -E '^Environment=ASPNETCORE_URLS=' "$svc_path" | sed -E 's/.*:([0-9]+)\s*$/\1/' | tail -n1
+  # Prefer env file (source of truth), then fall back to unit file or runtime env
+  local domain="$1"
+  local envf; envf="$(envfile_path "$domain")"
+  if [[ -f "$envf" ]]; then
+    local p; p="$(awk -F= '/^PORT=/{print $2; exit}' "$envf" | tr -d ' \t\r')"
+    [[ -n "$p" ]] && echo "$p" && return 0
+  fi
+  local svc_path; svc_path="$(service_path "$domain")"
+  if [[ -f "$svc_path" ]]; then
+    local p
+    p="$(sed -n 's/^Environment=PORT=\([0-9]\+\).*$/\1/p' "$svc_path" | tail -n1)"
+    [[ -n "$p" ]] && echo "$p" && return 0
+    p="$(sed -n 's/^Environment=ASPNETCORE_URLS=.*:\([0-9]\+\).*$/\1/p' "$svc_path" | tail -n1)"
+    [[ -n "$p" ]] && echo "$p" && return 0
+  fi
+  local p
+  p="$(systemctl show "$(service_name "$domain")" -p Environment 2>/dev/null | sed -n 's/^Environment=.*PORT=\([0-9]\+\).*$/\1/p' | head -n1)"
+  [[ -n "$p" ]] && echo "$p" && return 0
+  return 1
 }
 
 port_in_use(){ ss -ltnH | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"; }
@@ -377,7 +392,16 @@ cmd_check(){
   echo "CONF_DIR=$CONF_DIR"
   echo "VHCONF=$vh"
   echo "DOCROOT=$wd"
-  if p="$(get_port_from_service "$domain" 2>/dev/null)"; then echo "PORT=$p"; else echo "PORT=(not assigned yet)"; fi
+  local p_env=""
+  if p_env="$(get_port_from_service "$domain" 2>/dev/null)"; then
+    echo "PORT=$p_env"
+  else
+    echo "PORT=(not assigned yet)"
+  fi
+  # also show the proxy handler port from vhost (helps debug)
+  local p_proxy=""
+  p_proxy="$(awk '/^[[:space:]]*handler[[:space:]]+http:\/\/127\.0\.0\.1:/ { if (match($0, /127\.0\.0\.1:([0-9]+)/, a)) { print a[1]; exit } }' "$vh" 2>/dev/null || true)"
+  [[ -n "$p_proxy" ]] && echo "PROXY_PORT=$p_proxy"
 }
 
 cmd_enable(){
@@ -409,14 +433,13 @@ cmd_enable(){
 
   local dll_path; dll_path="$(resolve_dll "$wd" "$dll")"
 
-  # (Optional) Persist ASP.NET Data Protection keys for stable auth cookies
+  # Persist ASP.NET Data Protection keys for stable auth cookies
   local dpdir="/home/$domain/.aspnet/DataProtection-Keys"
   mkdir -p "$dpdir" || true
   chown -R "$(stat -c '%U' "$wd")":"$(stat -c '%U' "$wd")" "/home/$domain/.aspnet" || true
 
   # Write/update service + env; always restart to pick up changes
   create_service "$domain" "$wd" "$port" "$dll_path"
-  # add DP env var if not present
   if ! grep -q '^ASPNETCORE_DATA_PROTECTION_DIR=' "$(envfile_path "$domain")"; then
     echo "ASPNETCORE_DATA_PROTECTION_DIR=$dpdir" >> "$(envfile_path "$domain")"
   fi
@@ -425,7 +448,7 @@ cmd_enable(){
   systemctl enable "$(service_name "$domain")"
   systemctl restart "$(service_name "$domain")"
 
-  # Update reverse proxy to chosen port and reload OLS (with de-dup)
+  # Update reverse proxy to chosen port and reload OLS (dedup root contexts)
   inject_proxy_context "$vh" "$port"
   ols_reload
 

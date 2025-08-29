@@ -297,69 +297,75 @@ fix_listener_mappings(){
   local domain="$1" vhconf="$2"
   local httpdc="$CONF_DIR/httpd_config.conf"
   [[ -f "$httpdc" ]] || err "OpenLiteSpeed httpd_config.conf not found at $httpdc"
+
   local vhname; vhname="$(basename "$(dirname "$vhconf")")"
   local d1="$domain"
   local d2="www.$domain"
 
   cp -a "$httpdc" "$httpdc.bak.$(date +%s)"
 
+  # Portable awk (works with mawk / busybox / gawk). Avoids reserved names and [:space:].
   awk -v VH="$vhname" -v D1="$d1" -v D2="$d2" '
-    BEGIN{
-      in=0; addr=""; sec="0"; hasmap=0
-    }
+    BEGIN { inblk=0; addr=""; sec="0"; hasmap=0 }
     {
       line=$0
 
-      # Entering a listener block
-      if (line ~ /^[[:space:]]*listener[[:space:]]+/) {
-        in=1; addr=""; sec="0"; hasmap=0
+      # listener start
+      if (line ~ /^[ \t]*listener[ \t]+/) {
+        inblk=1; addr=""; sec="0"; hasmap=0
         print line
         next
       }
 
-      if (in==1) {
-        # Capture address
-        if (line ~ /^[[:space:]]*address[[:space:]]+/) {
-          n=split(line, a, /[[:space:]]+/)
-          if (n>=2) addr=a[2]
-          print line
+      if (inblk==1) {
+        # address line
+        if (line ~ /^[ \t]*address[ \t]+/) {
+          gsub(/^[ \t]*address[ \t]+/, "", line)
+          # token ends at first whitespace or brace
+          split(line, a, /[ \t]/)
+          addr=a[1]
+          print $0
           next
         }
-        # Capture secure flag
-        if (line ~ /^[[:space:]]*secure[[:space:]]+/) {
-          n=split(line, a, /[[:space:]]+/)
-          if (n>=2) sec=a[2]
-          print line
+
+        # secure line
+        if (line ~ /^[ \t]*secure[ \t]+/) {
+          gsub(/^[ \t]*secure[ \t]+/, "", line)
+          split(line, a, /[ \t]/)
+          sec=a[1]
+          print $0
           next
         }
-        # Handle map lines
-        if (line ~ /^[[:space:]]*map[[:space:]]+/) {
+
+        # map lines (replace *any* existing domain map lines with ours, once)
+        if (line ~ /^[ \t]*map[ \t]+/) {
           if (index(line, D1)>0 || index(line, D2)>0) {
             if (hasmap==0) {
               print "  map  " VH "  " D1 " " D2
               hasmap=1
             }
-            next  # drop the original domain mapping line
+            next
           }
-          print line
+          print $0
           next
         }
-        # Closing brace of listener: ensure our map exists when needed
-        if (line ~ /^\}/) {
+
+        # listener end
+        if (line ~ /^[ \t]*}/) {
           need=0
-          if (addr ~ /:80/ || addr ~ /\*:80/ || addr ~ /0\.0\.0\.0:80/ || addr ~ /\[::\]:80/) need=1
-          if (sec=="1" || addr ~ /:443/ || addr ~ /\*:443/ || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
+          if (addr ~ /:80/      || addr ~ /\*:80/      || addr ~ /0\.0\.0\.0:80/   || addr ~ /\[::\]:80/)  need=1
+          if (sec=="1"          || addr ~ /:443/       || addr ~ /\*:443/          || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
           if (need==1 && hasmap==0) {
             print "  map  " VH "  " D1 " " D2
           }
-          in=0; addr=""; sec="0"; hasmap=0
-          print line
+          inblk=0; addr=""; sec="0"; hasmap=0
+          print $0
           next
         }
       }
 
-      # Default passthrough
-      print line
+      # passthrough
+      print $0
     }
   ' "$httpdc" > /tmp/httpd_config.conf.new
 
@@ -369,17 +375,16 @@ fix_listener_mappings(){
   echo "--- Listener mappings for $domain ---"
   awk -v D1="$d1" -v D2="$d2" '
     BEGIN{L="";A="";S="0"}
-    /^[[:space:]]*listener[[:space:]]+/ {L=$2; A=""; S="0"}
-    /^[[:space:]]*address[[:space:]]+/ {split($0,a,/[[:space:]]+/); A=a[2]}
-    /^[[:space:]]*secure[[:space:]]+/  {split($0,a,/[[:space:]]+/); S=a[2]}
-    /^[[:space:]]*map[[:space:]]+/ {
+    /^[ \t]*listener[ \t]+/ {L=$2; A=""; S="0"}
+    /^[ \t]*address[ \t]+/  {line=$0; gsub(/^[ \t]*address[ \t]+/, "", line); split(line,a,/[ \t]/); A=a[1]}
+    /^[ \t]*secure[ \t]+/   {line=$0; gsub(/^[ \t]*secure[ \t]+/, "", line); split(line,a,/[ \t]/); S=a[1]}
+    /^[ \t]*map[ \t]+/ {
       if (index($0,D1)>0 || index($0,D2)>0) {
         printf("listener=%s  address=%s  secure=%s  %s\n", L, A, S, $0)
       }
     }
   ' "$httpdc" || true
 }
-
 
 # ---------- systemd ----------
 create_service(){

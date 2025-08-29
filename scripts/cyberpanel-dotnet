@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 shopt -s extglob
 
+# ---------- UI helpers ----------
 red(){ echo -e "\e[31m$*\e[0m"; }
 grn(){ echo -e "\e[32m$*\e[0m"; }
 yel(){ echo -e "\e[33m$*\e[0m"; }
@@ -10,7 +11,7 @@ info(){ echo "[i] $*"; }
 sudo_ok(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || err "Run as root (sudo)."; }
 need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1 (please install it)"; }
 
-# cyberpanel-dotnet — main CLI (autodetect + fail-fast)
+# ---------- Globals ----------
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/dotnet-apps"
 STATE_DIR="/etc/cyberpanel-dotnet"
@@ -24,11 +25,13 @@ VHOSTS_DIR=""
 
 mkdir -p "$STATE_DIR" "$ENV_DIR"
 
+# ---------- ID helpers ----------
 sanitize_id(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'; }
 service_name(){ local id; id=$(sanitize_id "$1"); echo "dotnet-app@${id}.service"; }
 service_path(){ echo "$SYSTEMD_DIR/$(service_name "$1")"; }
 envfile_path(){ local id; id=$(sanitize_id "$1"); echo "$ENV_DIR/${id}.env"; }
 
+# ---------- OpenLiteSpeed discovery ----------
 _detect_lsws_root(){
   if [[ -n "${LSWS_ROOT:-}" && -x "${LSWS_ROOT}/bin/lswsctrl" ]]; then echo "$LSWS_ROOT"; return; fi
   if [[ -x "/usr/local/lsws/bin/lswsctrl" ]]; then echo "/usr/local/lsws"; return; fi
@@ -41,13 +44,32 @@ _detect_lsws_root(){
   return 1
 }
 
+# Robust vhost finder:
+#  1) exact folder match: $VHOSTS_DIR/<domain>/vhconf.conf
+#  2) search by docRoot == /home/<domain>/public_html (quoted or not)
+#  3) any docRoot ending in public_html whose file path contains <domain>
+#  4) any vhost folder path containing <domain>
 vhconf_for(){
-  local domain="$1"; local candidate
+  local domain="$1"
+  local candidate=""
+
+  # 1) exact folder match
   candidate="$VHOSTS_DIR/$domain/vhconf.conf"
   if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
-  candidate=$(find "$VHOSTS_DIR" -maxdepth 2 -type f -name 'vhconf.conf' | grep -E "/${domain}/vhconf\.conf$" -m1 || true)
-  [[ -n "$candidate" ]] || err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR. Create the site in CyberPanel first."
-  echo "$candidate"
+
+  # 2) search by exact docRoot
+  candidate=$(grep -Rsl --include=vhconf.conf -E "^[[:space:]]*docRoot[[:space:]]+\"?/home/${domain}/public_html/?\"?$" "$VHOSTS_DIR" 2>/dev/null | head -n1 || true)
+  if [[ -n "$candidate" ]]; then echo "$candidate"; return; fi
+
+  # 3) docRoot ends with public_html and file path includes domain
+  candidate=$(grep -Rsl --include=vhconf.conf -iE "^[[:space:]]*docRoot[[:space:]]+.*public_html/?\"?$" "$VHOSTS_DIR" 2>/dev/null | grep -i "/${domain}/" -m1 || true)
+  if [[ -n "$candidate" ]]; then echo "$candidate"; return; fi
+
+  # 4) vhost folder path contains the domain
+  candidate=$(find "$VHOSTS_DIR" -maxdepth 2 -type f -name 'vhconf.conf' -ipath "*/${domain}*/vhconf.conf" -print -quit 2>/dev/null || true)
+  if [[ -n "$candidate" ]]; then echo "$candidate"; return; fi
+
+  err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR. Create the site in CyberPanel first."
 }
 
 docroot_from_vhconf(){
@@ -67,6 +89,7 @@ workdir_for_domain(){
   echo "$guess"
 }
 
+# ---------- dotnet + port helpers ----------
 find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
 
 get_port_from_service(){
@@ -110,6 +133,7 @@ resolve_dll(){
   err "DLL '$dll' not found under '$workdir'. Upload your published files to the site's document root."
 }
 
+# ---------- OLS integration ----------
 ols_reload(){
   if [[ -x "$LSWS_ROOT/bin/lswsctrl" ]]; then "$LSWS_ROOT/bin/lswsctrl" reload || true; fi
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
@@ -120,6 +144,7 @@ inject_proxy_context(){
   [[ -f "$vhconf" ]] || err "vhconf missing: $vhconf"
   cp -a "$vhconf" "$vhconf.bak.$(date +%s)"
   tmp=$(mktemp)
+  # Remove previous managed block (if present)
   awk -v B="$MARK_BEGIN" -v E="$MARK_END" 'BEGIN{del=0} $0~B{del=1; next} $0~E{del=0; next} {if(!del) print $0}' "$vhconf" > "$tmp"
   {
     echo "$MARK_BEGIN"
@@ -143,6 +168,7 @@ remove_proxy_context(){
   mv "$vhconf.tmp" "$vhconf"
 }
 
+# ---------- systemd ----------
 create_service(){
   local domain="$1" workdir="$2" port="$3" absdll="$4"; local svc="$(service_path "$domain")"
   local id; id=$(sanitize_id "$domain")
@@ -176,6 +202,56 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# ---------- Preflight ----------
+autodetect(){
+  sudo_ok
+  need awk; need sed; need ss
+  local dot; dot=$(find_dotnet) || err "dotnet runtime not found. Install .NET (e.g., apt install dotnet-runtime-8.0) and retry."
+  LSWS_ROOT=$(_detect_lsws_root) || err "OpenLiteSpeed not found. Install CyberPanel/OpenLiteSpeed first."
+  VHOSTS_DIR="$LSWS_ROOT/conf/vhosts"
+  [[ -d "$VHOSTS_DIR" ]] || err "Vhosts directory missing at $VHOSTS_DIR. Is OpenLiteSpeed configured?"
+  [[ -d "$SYSTEMD_DIR" && -w "$SYSTEMD_DIR" ]] || err "Systemd directory $SYSTEMD_DIR not writable."
+}
+
+preflight_domain(){
+  local domain="$1"; [[ -n "$domain" ]] || err "Domain is required"
+  local vh; vh=$(vhconf_for "$domain") || exit 1
+  [[ -f "$vh" ]] || err "vhconf not found for $domain"
+  local wd; wd=$(workdir_for_domain "$domain") || exit 1
+  [[ -d "$wd" ]] || err "Document root '$wd' does not exist for $domain"
+}
+
+# ---------- Commands ----------
+usage(){ cat <<USAGE
+cyberpanel-dotnet — manage .NET apps on CyberPanel/OpenLiteSpeed
+
+Commands:
+  enable  <domain> [--dll <App.dll>] [--port N]   Create service + OLS proxy + start (DLL can come from .dotnet)
+  redeploy [<domain>]                               Restart app (all or one)
+  status  <domain>                                  Show systemd status
+  logs    <domain> [--lines N|-n N] [-f]           Tail logs / last N lines
+  port    <domain>                                  Print assigned port
+  disable <domain>                                  Stop service and remove OLS proxy
+  remove  <domain> [--purge-runtime]                Stop + disable + remove service and proxy
+  list                                              List managed domains
+  check   <domain>                                  Preflight and print detected paths
+  help                                              This help
+USAGE
+}
+
+list_domains(){ ls -1 $SYSTEMD_DIR/dotnet-app@*.service 2>/dev/null | sed -E 's#.*/dotnet-app@([^/]+)\.service#\1#' | tr '_' '.' | sort || true; }
+
+cmd_check(){
+  local domain="$1"; autodetect; preflight_domain "$domain"
+  local vh=$(vhconf_for "$domain")
+  local wd=$(workdir_for_domain "$domain")
+  echo "LSWS_ROOT=$LSWS_ROOT"
+  echo "VHOSTS_DIR=$VHOSTS_DIR"
+  echo "VHCONF=$vh"
+  echo "DOCROOT=$wd"
+  if p=$(get_port_from_service "$domain" 2>/dev/null); then echo "PORT=$p"; else echo "PORT=(not assigned yet)"; fi
+}
+
 cmd_enable(){
   local domain="$1"; shift || true
   local dll=""; local port="";
@@ -186,19 +262,10 @@ cmd_enable(){
       *) err "Unknown flag: $1";;
     esac
   done
-  sudo_ok
-  need awk; need sed; need ss
-  local dot; dot=$(find_dotnet) || err "dotnet runtime not found. Install .NET (e.g., apt install dotnet-runtime-8.0) and retry."
-  LSWS_ROOT=$(_detect_lsws_root) || err "OpenLiteSpeed not found. Install CyberPanel/OpenLiteSpeed first."
-  VHOSTS_DIR="$LSWS_ROOT/conf/vhosts"
-  [[ -d "$VHOSTS_DIR" ]] || err "Vhosts directory missing at $VHOSTS_DIR. Is OpenLiteSpeed configured?"
 
-  [[ -n "$domain" ]] || err "Domain is required"
-  local vh; vh=$(vhconf_for "$domain") || exit 1
-  [[ -f "$vh" ]] || err "vhconf not found for $domain"
-  local wd; wd=$(workdir_for_domain "$domain") || exit 1
-  [[ -d "$wd" ]] || err "Document root '$wd' does not exist for $domain"
-
+  autodetect; preflight_domain "$domain"
+  local vh=$(vhconf_for "$domain")
+  local wd=$(workdir_for_domain "$domain")
   local dll_path; dll_path=$(resolve_dll "$wd" "$dll")
   if [[ -z "$port" ]]; then port=$(alloc_port "$domain"); else [[ "$port" =~ ^[0-9]+$ ]] || err "--port must be a number"; fi
 
@@ -230,7 +297,7 @@ MSG
 }
 
 cmd_redeploy(){
-  sudo_ok
+  autodetect
   local domain="${1:-}"
   if [[ -z "$domain" ]]; then
     for unit in $SYSTEMD_DIR/dotnet-app@*.service; do
@@ -245,10 +312,10 @@ cmd_redeploy(){
   fi
 }
 
-cmd_status(){ sudo_ok; local domain="$1"; [[ -n "$domain" ]] || err "Domain required"; systemctl status "$(service_name "$domain")"; }
+cmd_status(){ autodetect; local domain="$1"; [[ -n "$domain" ]] || err "Domain required"; systemctl status "$(service_name "$domain")"; }
 
 cmd_logs(){
-  sudo_ok
+  autodetect
   local domain="$1"; shift || true
   [[ -n "$domain" ]] || err "Domain required"
   local lines=""
@@ -264,27 +331,27 @@ cmd_logs(){
 }
 
 cmd_port(){
-  sudo_ok; local domain="$1"; [[ -n "$domain" ]] || err "Domain required";
+  autodetect; local domain="$1"; [[ -n "$domain" ]] || err "Domain required";
   if ! p=$(get_port_from_service "$domain"); then err "No port assigned yet. Run 'enable' first."; fi
   echo "$p"
 }
 
 remove_proxy_for(){
   local domain="$1"
-  local vh; vh=$(vhconf_for "$domain")
+  local vh=$(vhconf_for "$domain")
   remove_proxy_context "$vh" || true
   ols_reload || true
 }
 
 cmd_disable(){
-  sudo_ok; local domain="$1"; [[ -n "$domain" ]] || err "Domain required";
+  autodetect; local domain="$1"; [[ -n "$domain" ]] || err "Domain required";
   systemctl stop "$(service_name "$domain")" || true
   remove_proxy_for "$domain"
   grn "Disabled $domain (service stopped, proxy removed)"
 }
 
 cmd_remove(){
-  sudo_ok; local domain="$1"; shift || true
+  autodetect; local domain="$1"; shift || true
   [[ -n "$domain" ]] || err "Domain required"
   local purge=0
   while [[ $# -gt 0 ]]; do
@@ -307,40 +374,7 @@ cmd_remove(){
   grn "Removed $domain (service + proxy)."
 }
 
-usage(){ cat <<USAGE
-cyberpanel-dotnet — manage .NET apps on CyberPanel/OpenLiteSpeed
-
-Commands:
-  enable  <domain> [--dll <App.dll>] [--port N]   Create service + OLS proxy + start (DLL can come from .dotnet)
-  redeploy [<domain>]                               Restart app (all or one)
-  status  <domain>                                  Show systemd status
-  logs    <domain> [--lines N|-n N] [-f]           Tail logs / last N lines
-  port    <domain>                                  Print assigned port
-  disable <domain>                                  Stop service and remove OLS proxy
-  remove  <domain> [--purge-runtime]                Stop + disable + remove service and proxy
-  list                                              List managed domains
-  check   <domain>                                  Preflight and print detected paths
-  help                                              This help
-USAGE
-}
-
-list_domains(){ ls -1 $SYSTEMD_DIR/dotnet-app@*.service 2>/dev/null | sed -E 's#.*/dotnet-app@([^/]+)\.service#\1#' | tr '_' '.' | sort || true; }
-
-cmd_check(){
-  sudo_ok
-  need awk; need sed; need ss
-  local domain="$1"; [[ -n "$domain" ]] || err "Domain required"
-  LSWS_ROOT=$(_detect_lsws_root) || err "OpenLiteSpeed not found. Install CyberPanel/OpenLiteSpeed first."
-  VHOSTS_DIR="$LSWS_ROOT/conf/vhosts"
-  local vh=$(vhconf_for "$domain")
-  local wd=$(workdir_for_domain "$domain")
-  echo "LSWS_ROOT=$LSWS_ROOT"
-  echo "VHOSTS_DIR=$VHOSTS_DIR"
-  echo "VHCONF=$vh"
-  echo "DOCROOT=$wd"
-  if p=$(get_port_from_service "$domain" 2>/dev/null); then echo "PORT=$p"; else echo "PORT=(not assigned yet)"; fi
-}
-
+# ---------- Entry ----------
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in

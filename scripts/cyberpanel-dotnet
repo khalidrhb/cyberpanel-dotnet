@@ -177,7 +177,7 @@ workdir_for_domain(){
 find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
 
 get_port_from_service(){
-  # Prefer env file (source of truth), then fall back to unit file or runtime env
+  # Prefer env file (source of truth), then unit or runtime env
   local domain="$1"
   local envf; envf="$(envfile_path "$domain")"
   if [[ -f "$envf" ]]; then
@@ -292,6 +292,56 @@ remove_proxy_context(){
   mv "$vhconf.tmp" "$vhconf"
 }
 
+# Ensure mapping in listeners for domain + www.domain
+fix_listener_mappings(){
+  local domain="$1" vhconf="$2"
+  local httpdc="$CONF_DIR/httpd_config.conf"
+  [[ -f "$httpdc" ]] || err "OpenLiteSpeed httpd_config.conf not found at $httpdc"
+  local vhname; vhname="$(basename "$(dirname "$vhconf")")"
+  local d1="$domain"
+  local d2="www.$domain"
+
+  cp -a "$httpdc" "$httpdc.bak.$(date +%s)"
+
+  awk -v VH="$vhname" -v D1="$d1" -v D2="$d2" '
+    BEGIN{in=0; addr=""; sec="0"; printed=0}
+    /^[[:space:]]*listener[[:space:]]+/ { in=1; addr=""; sec="0"; printed=0; print; next }
+    in==1 && /^[[:space:]]*address[[:space:]]+/ { addr=$2; print; next }
+    in==1 && /^[[:space:]]*secure[[:space:]]+/  { sec=$2; print; next }
+    in==1 && /^[[:space:]]*map[[:space:]]+/ {
+      # If this line mentions our domains, replace it with our mapping once
+      if ($0 ~ D1 || $0 ~ D2) {
+        if (!printed) { printf("  map  %s  %s %s\n", VH, D1, D2); printed=1; }
+        next
+      }
+      print; next
+    }
+    in==1 && /^\}/ {
+      # Ensure a mapping exists for :80 and :443/secure listeners
+      need=0
+      if (addr ~ /:80/ || addr ~ /\*:80/ || addr ~ /0\.0\.0\.0:80/ || addr ~ /\[::\]:80/) need=1
+      if (sec=="1" || addr ~ /:443/ || addr ~ /\*:443/ || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
+      if (need && !printed) { printf("  map  %s  %s %s\n", VH, D1, D2); printed=1; }
+      in=0; print; next
+    }
+    { print }
+  ' "$httpdc" > /tmp/httpd_config.conf.new
+
+  mv /tmp/httpd_config.conf.new "$httpdc"
+  ols_reload
+
+  echo "--- Listener mappings for $domain ---"
+  awk '
+    BEGIN{L="";A="";S="0"}
+    /^[[:space:]]*listener[[:space:]]+/ {L=$2; A=""; S="0"}
+    /^[[:space:]]*address[[:space:]]+/ {A=$2}
+    /^[[:space:]]*secure[[:space:]]+/  {S=$2}
+    /^[[:space:]]*map[[:space:]]+/ && ($0 ~ /'"$d1"'/ || $0 ~ /'"$d2"'/) {
+      printf("listener=%s  address=%s  secure=%s  %s\n", L, A, S, $0)
+    }
+  ' "$httpdc" || true
+}
+
 # ---------- systemd ----------
 create_service(){
   local domain="$1" workdir="$2" port="$3" absdll="$4"
@@ -355,15 +405,16 @@ usage(){ cat <<USAGE
 cyberpanel-dotnet — manage .NET apps on CyberPanel/OpenLiteSpeed
 
 Commands:
-  enable  <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]
+  enable   <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]
   redeploy [<domain>]
-  status  <domain>
-  logs    <domain> [--lines N|-n N] [-f]
-  port    <domain>
-  disable <domain> [--vhconf /path/to/vhconf.conf]
-  remove  <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]
+  status   <domain>
+  logs     <domain> [--lines N|-n N] [-f]
+  port     <domain>
+  disable  <domain> [--vhconf /path/to/vhconf.conf]
+  remove   <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]
   list
-  check   <domain> [--vhconf /path/to/vhconf.conf]
+  check    <domain> [--vhconf /path/to/vhconf.conf]
+  fixmap   <domain> [--vhconf /path/to/vhconf.conf]
   help
 USAGE
 }
@@ -398,7 +449,6 @@ cmd_check(){
   else
     echo "PORT=(not assigned yet)"
   fi
-  # also show the proxy handler port from vhost (helps debug)
   local p_proxy=""
   p_proxy="$(awk '/^[[:space:]]*handler[[:space:]]+http:\/\/127\.0\.0\.1:/ { if (match($0, /127\.0\.0\.1:([0-9]+)/, a)) { print a[1]; exit } }' "$vh" 2>/dev/null || true)"
   [[ -n "$p_proxy" ]] && echo "PROXY_PORT=$p_proxy"
@@ -568,19 +618,36 @@ cmd_remove(){
   grn "Removed $domain (service + proxy)."
 }
 
+cmd_fixmap(){
+  local domain="$1"; shift || true
+  local vh_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vhconf) vh_override="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  autodetect; preflight_domain "$domain" "$vh_override"
+  local vh; vh="$(vhconf_for "$domain" "$vh_override")"
+  fix_listener_mappings "$domain" "$vh"
+  grn "Mappings ensured for $domain → $(basename "$(dirname "$vh")")."
+  echo "Tip: test via  curl -k -I https://$domain  and  curl -k -I http://$domain"
+}
+
 # ---------- Entry ----------
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    enable)      [[ $# -ge 1 ]] || err "Usage: enable <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]"; cmd_enable "$@";;
-    redeploy)    cmd_redeploy "$@";;
-    status)      [[ $# -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
-    logs)        [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
-    port)        [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
-    disable)     [[ $# -ge 1 ]] || err "Usage: disable <domain> [--vhconf /path/to/vhconf.conf]"; cmd_disable "$@";;
-    remove)      [[ $# -ge 1 ]] || err "Usage: remove <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]"; cmd_remove "$@";;
-    list)        list_domains;;
-    check)       [[ $# -ge 1 ]] || err "Usage: check <domain> [--vhconf /path/to/vhconf.conf]"; cmd_check "$@";;
+    enable)    [[ $# -ge 1 ]] || err "Usage: enable <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]"; cmd_enable "$@";;
+    redeploy)  cmd_redeploy "$@";;
+    status)    [[ $# -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
+    logs)      [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
+    port)      [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
+    disable)   [[ $# -ge 1 ]] || err "Usage: disable <domain> [--vhconf /path/to/vhconf.conf]"; cmd_disable "$@";;
+    remove)    [[ $# -ge 1 ]] || err "Usage: remove <domain> [--purge-runtime] [--vhconf /path/to/vhconf.conf]"; cmd_remove "$@";;
+    list)      list_domains;;
+    check)     [[ $# -ge 1 ]] || err "Usage: check <domain> [--vhconf /path/to/vhconf.conf]"; cmd_check "$@";;
+    fixmap)    [[ $# -ge 1 ]] || err "Usage: fixmap <domain> [--vhconf /path/to/vhconf.conf]"; cmd_fixmap "$@";;
     help|--help|-h|"") usage;;
     *) err "Unknown command: $cmd";;
   esac

@@ -55,16 +55,44 @@ docroot_from_vhconf(){
   return 1
 }
 
+# Map finder: read listener "map" lines anywhere in $CONF_DIR to resolve domain -> vhost name
+_vhname_from_map(){
+  local domain="$1"
+  local f line name
+  shopt -s nullglob
+  # Search all *.conf (including httpd_config.conf and listener confs)
+  while IFS= read -r -d '' f; do
+    # lines like:  map   myVHost   flezora.com,www.flezora.com
+    # or:          map   myVHost   *
+    while IFS= read -r line; do
+      # Does the line contain our domain?
+      echo "$line" | grep -qi -- "$domain" || continue
+      name=$(awk 'BEGIN{IGNORECASE=1}
+        /^[[:space:]]*map[[:space:]]+/ {
+          for(i=1;i<=NF;i++){
+            if(tolower($i)=="map"){ if(i+1<=NF){ print $(i+1); exit } }
+          }
+        }' <<<"$line")
+      if [[ -n "$name" ]]; then
+        echo "$name"
+        return 0
+      fi
+    done < <(grep -iE '^[[:space:]]*map[[:space:]]+' "$f" 2>/dev/null || true)
+  done < <(find "$CONF_DIR" -type f -name "*.conf" -print0 2>/dev/null)
+  return 1
+}
+
 # Robust vhost finder:
 #  1) exact folder match: $VHOSTS_DIR/<domain>/vhconf.conf
-#  2) search across BOTH $VHOSTS_DIR and $CONF_DIR for docRoot == /home/<domain>/public_html
-#  3) any docRoot containing "<domain>" and ending with public_html
-#  4) any vhconf.conf path containing "<domain>"
-#  5) optionally accept user override: --vhconf /path/to/vhconf.conf
+#  2) parse listener map lines to resolve domain -> vhName, then build vhost path
+#  3) search by docRoot == /home/<domain>/public_html (quoted or not) across both $VHOSTS_DIR and $CONF_DIR
+#  4) docRoot contains domain + ends with public_html
+#  5) any vhconf.conf path containing the domain
+#  6) allow manual override via 2nd param
 vhconf_for(){
   local domain="$1"
   local override="${2:-}"
-  [[ -n "$override" ]] && [[ -f "$override" ]] && { echo "$override"; return; }
+  [[ -n "$override" && -f "$override" ]] && { echo "$override"; return; }
 
   local candidate=""
   local exact_dr; exact_dr=$(trim_slash "/home/$domain/public_html")
@@ -73,31 +101,37 @@ vhconf_for(){
   candidate="$VHOSTS_DIR/$domain/vhconf.conf"
   if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
 
-  # build search space
-  local d; local found_exact=""; local found_sub=""; local found_path=""
+  # 2) listener map -> vhName
+  local vhname
+  if vhname=$(_vhname_from_map "$domain"); then
+    candidate="$VHOSTS_DIR/$vhname/vhconf.conf"
+    if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
+  fi
+
+  # 3) docRoot exact
+  local d dr hit_sub hit_path
   for d in "$VHOSTS_DIR" "$CONF_DIR"; do
     [[ -d "$d" ]] || continue
     while IFS= read -r -d '' f; do
-      # try to read docRoot
-      local dr; dr=$(docroot_from_vhconf "$f" || true)
-      if [[ -n "$dr" ]]; then
-        if [[ "$(trim_slash "$dr")" == "$exact_dr" ]]; then
-          echo "$f"; return
-        fi
-        # loose match: docRoot mentions domain + public_html
+      dr=$(docroot_from_vhconf "$f" || true)
+      if [[ -n "$dr" && "$(trim_slash "$dr")" == "$exact_dr" ]]; then
+        echo "$f"; return
+      fi
+      # 4) loose docRoot match: mentions domain and public_html
+      if [[ -z "$hit_sub" && -n "$dr" ]]; then
         if echo "$dr" | grep -qiE "/${domain}(/|.*)public_html/?$"; then
-          [[ -z "$found_sub" ]] && found_sub="$f"
+          hit_sub="$f"
         fi
       fi
-      # path match as last resort
-      if echo "$f" | grep -qi "/${domain}.*vhconf\.conf$"; then
-        [[ -z "$found_path" ]] && found_path="$f"
+      # 5) path contains domain
+      if [[ -z "$hit_path" ]]; then
+        echo "$f" | grep -qi "/${domain}.*vhconf\.conf$" && hit_path="$f"
       fi
     done < <(find "$d" -type f -name 'vhconf.conf' -print0 2>/dev/null)
   done
 
-  [[ -n "$found_sub" ]]  && { echo "$found_sub";  return; }
-  [[ -n "$found_path" ]] && { echo "$found_path"; return; }
+  [[ -n "$hit_sub"  ]] && { echo "$hit_sub";  return; }
+  [[ -n "$hit_path" ]] && { echo "$hit_path"; return; }
 
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR or $CONF_DIR.
 Hints:

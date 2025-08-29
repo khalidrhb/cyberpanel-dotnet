@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch /etc/dotnet-apps for changes and trigger auto-deploy
+
+[Path]
+PathModified=/etc/dotnet-apps
+Unit=dotnet-autodeploy.service
+
+[Install]
+WantedBy=multi-user.target

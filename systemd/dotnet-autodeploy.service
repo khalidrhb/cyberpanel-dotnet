@@ -1,0 +1,6 @@
+[Unit]
+Description=CyberPanel .NET auto-deploy scanner
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dotnet-autodeploy

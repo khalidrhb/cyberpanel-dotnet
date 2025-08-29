@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s extglob
+
+red(){ echo -e "\e[31m$*\e[0m"; }
+grn(){ echo -e "\e[32m$*\e[0m"; }
+yel(){ echo -e "\e[33m$*\e[0m"; }
+err(){ red "[ERROR] $*" 1>&2; exit 1; }
+info(){ echo "[i] $*"; }
+sudo_ok(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || err "Run as root (sudo)."; }
+need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1 (please install it)"; }
+
+# cyberpanel-dotnet-wrapper — reads env + marker and runs dotnet
+need dotnet
+
+DOMAIN="${DOMAIN:-}"
+DOCROOT="${DOCROOT:-}"
+PORT="${PORT:-}"
+DLL_PATH_DEFAULT="${DLL_PATH:-}"
+
+[[ -n "$DOCROOT" && -d "$DOCROOT" ]] || err "DOCROOT not set or invalid in environment."
+[[ -n "$PORT" ]] || err "PORT not set in environment."
+
+resolve_marker(){
+  local f="$DOCROOT/.dotnet"
+  if [[ -f "$f" ]]; then
+    awk -F= '/^\s*DLL\s*=/{print $2; exit}' "$f" | tr -d " \t\r"
+  fi
+}
+
+pick_dll(){
+  local from_marker; from_marker=$(resolve_marker || true)
+  if [[ -n "$from_marker" ]]; then
+    if [[ -f "$DOCROOT/$from_marker" ]]; then echo "$DOCROOT/$from_marker"; return; fi
+  fi
+  if [[ -n "$DLL_PATH_DEFAULT" && -f "$DLL_PATH_DEFAULT" ]]; then echo "$DLL_PATH_DEFAULT"; return; fi
+  local first; first=$(find "$DOCROOT" -maxdepth 1 -type f -name "*.dll" | head -n1 || true)
+  [[ -n "$first" ]] || err "No DLL found. Provide DLL=YourApp.dll in $DOCROOT/.dotnet"
+  echo "$first"
+}
+
+export DOTNET_ENVIRONMENT="${DOTNET_ENVIRONMENT:-Production}"
+export ASPNETCORE_URLS="http://127.0.0.1:${PORT}"
+
+DLL="$(pick_dll)"
+exec dotnet "$DLL"

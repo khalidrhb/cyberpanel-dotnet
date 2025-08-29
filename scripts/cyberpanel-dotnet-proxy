@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Usage: sudo cyberpanel-dotnet-proxy <domain> <port>
-# Wires OpenLiteSpeed:
-#  - extprocessor (proxy → 127.0.0.1:<port>)
+# Wires OpenLiteSpeed for ASP.NET Core behind CyberPanel:
+#  - extprocessor -> 127.0.0.1:<port>
 #  - proxy context /
-#  - explicit /ConnectionHub context (SignalR)
-#  - WebSocket upgrade rewrite
-# Also ensures enableWebSocket 1 on :443 listeners.
+#  - proxy context /ConnectionHub (SignalR)
+#  - WebSocket upgrade rewrite (single block)
+#  - enableWebSocket 1 on :443 listeners
+# Safe: backs up, validates, auto-restores on error.
 set -euo pipefail
 
 DOMAIN="${1:-}"; PORT="${2:-}"
@@ -14,12 +14,121 @@ DOMAIN="${1:-}"; PORT="${2:-}"
 LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
 HTTPD_CONF="$LSWS_ROOT/conf/httpd_config.conf"
 
-require(){ command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }; }
-require awk
+fail(){ echo "[ERROR] $*" >&2; exit 1; }
 
-# --- enable WebSockets in HTTPS listeners (:443), idempotent ---
+require(){ command -v "$1" >/dev/null 2>&1 || fail "missing: $1"; }
+require awk
+require sed
+require grep
+
+# ---------- locate vhost file ----------
+pick_vhconf() {
+  local base="$LSWS_ROOT/conf/vhosts" picked=""
+  [[ -d "$base" ]] || return 1
+  # exact dir + prefix matches (domain-443 / domain_SSL etc.)
+  local cand=()
+  [[ -d "$base/$DOMAIN" ]] && cand+=("$base/$DOMAIN")
+  while IFS= read -r -d '' d; do cand+=("$d"); done \
+    < <(find "$base" -maxdepth 1 -type d -name "${DOMAIN}*" -print0 2>/dev/null || true)
+  # first pass
+  for d in "${cand[@]}"; do
+    [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
+    [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
+  done
+  # prefer SSL-ish names if not picked
+  if [[ -z "$picked" && ${#cand[@]} -gt 0 ]]; then
+    for d in "${cand[@]}"; do
+      [[ "$d" =~ 443|SSL|ssl ]] || continue
+      [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
+      [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
+    done
+  fi
+  [[ -n "$picked" ]] && echo "$picked" || return 1
+}
+VHCONF="$(pick_vhconf || true)"
+[[ -n "$VHCONF" ]] || fail "vhost config not found for $DOMAIN under $LSWS_ROOT/conf/vhosts"
+echo "[i] Using vhost config: $VHCONF"
+
+# ---------- backups ----------
+BK_VHOST="$VHCONF.bak.$(date +%s)"
+cp -a "$VHCONF" "$BK_VHOST"
+
+BK_HTTPD=""
 if [[ -f "$HTTPD_CONF" ]]; then
-  cp -a "$HTTPD_CONF" "$HTTPD_CONF.bak.$(date +%s)"
+  BK_HTTPD="$HTTPD_CONF.bak.$(date +%s)"
+  cp -a "$HTTPD_CONF" "$BK_HTTPD"
+fi
+
+EXT="dotnet_$(echo "$DOMAIN" | tr -cd '[:alnum:]_')"
+
+# ---------- clean previous auto blocks to avoid dup braces ----------
+sed -i '/# BEGIN: auto-dotnet-extprocessor /,/# END: auto-dotnet-extprocessor /d' "$VHCONF"
+sed -i '/# BEGIN: auto-dotnet-context-/,/# END: auto-dotnet-context-/d' "$VHCONF"
+sed -i '/# BEGIN: auto-dotnet-websocket/,/# END: auto-dotnet-websocket/d' "$VHCONF"
+sed -i '/# BEGIN: auto-dotnet-websocket-strong/,/# END: auto-dotnet-websocket-strong/d' "$VHCONF"
+
+# ---------- build clean blocks ----------
+read -r -d '' EXT_BLOCK <<EOT || true
+# BEGIN: auto-dotnet-extprocessor $EXT
+extprocessor $EXT {
+  type                    proxy
+  address                 127.0.0.1:$PORT
+  maxConns                100
+  initTimeout             60
+  retryTimeout            0
+  pcKeepAliveTimeout      120
+}
+# END: auto-dotnet-extprocessor $EXT
+EOT
+
+read -r -d '' CTX_ROOT <<EOT || true
+# BEGIN: auto-dotnet-context-$EXT
+context / {
+  type                    proxy
+  handler                 $EXT
+  addDefaultCharset       off
+}
+# END: auto-dotnet-context-$EXT
+EOT
+
+read -r -d '' CTX_HUB <<EOT || true
+# BEGIN: auto-dotnet-context-ConnectionHub-$EXT
+context /ConnectionHub {
+  type                    proxy
+  handler                 $EXT
+  addDefaultCharset       off
+}
+# END: auto-dotnet-context-ConnectionHub-$EXT
+EOT
+
+read -r -d '' RWT_BLOCK <<EOT || true
+# BEGIN: auto-dotnet-websocket
+rewrite  {
+  enable                  1
+  rewriteCond             %{HTTP:Connection} upgrade [NC]
+  rewriteCond             %{HTTP:Upgrade} websocket [NC]
+  rewriteRule             /(.*) ws://127.0.0.1:$PORT/\$1 [P,L]
+}
+# END: auto-dotnet-websocket
+EOT
+
+# ---------- insert blocks just BEFORE the final closing brace ----------
+awk -v extblk="$EXT_BLOCK" -v ctxroot="$CTX_ROOT" -v ctxhub="$CTX_HUB" -v rwt="$RWT_BLOCK" '
+  BEGIN{lastClose=0}
+  {buf[NR]=$0; if($0 ~ /^\s*}\s*$/) lastClose=NR}
+  END{
+    if(lastClose==0){ for(i=1;i<=NR;i++) print buf[i]; exit 0 }
+    for(i=1;i<lastClose;i++) print buf[i]
+    print extblk
+    print ctxroot
+    print ctxhub
+    print rwt
+    for(i=lastClose;i<=NR;i++) print buf[i]
+  }
+' "$VHCONF" > "$VHCONF.tmp" && mv "$VHCONF.tmp" "$VHCONF"
+
+# ---------- ensure WebSockets enabled on HTTPS listener(s) ----------
+if [[ -f "$HTTPD_CONF" ]]; then
   awk '
     BEGIN{inL=0; d=0; isSSL=0; hasWS=0}
     /^[[:space:]]*listener[[:space:]]+/ {inL=1; d=0; isSSL=0; hasWS=0}
@@ -40,112 +149,22 @@ if [[ -f "$HTTPD_CONF" ]]; then
   ' "$HTTPD_CONF" > "$HTTPD_CONF.tmp" && mv "$HTTPD_CONF.tmp" "$HTTPD_CONF"
 fi
 
-# --- locate vhost config for this domain ---
-pick_vhconf() {
-  local base="$LSWS_ROOT/conf/vhosts"
-  local cand=() picked=""
-  [[ -d "$base" ]] || return 1
-  [[ -d "$base/$DOMAIN" ]] && cand+=("$base/$DOMAIN")
-  while IFS= read -r -d '' d; do cand+=("$d"); done \
-    < <(find "$base" -maxdepth 1 -type d -name "${DOMAIN}*" -print0 2>/dev/null || true)
-
-  for d in "${cand[@]}"; do
-    [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
-    [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
-  done
-  if [[ -z "$picked" && ${#cand[@]} -gt 0 ]]; then
-    for d in "${cand[@]}"; do
-      [[ "$d" =~ 443|SSL|ssl ]] || continue
-      [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
-      [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
-    done
+# ---------- validate & restart; auto-restore on failure ----------
+if [[ -x "$LSWS_ROOT/bin/openlitespeed" ]]; then
+  if ! "$LSWS_ROOT/bin/openlitespeed" -t; then
+    echo "[!] Validation failed. Restoring backups…"
+    cp -a "$BK_VHOST" "$VHCONF"
+    [[ -n "$BK_HTTPD" && -f "$BK_HTTPD" ]] && cp -a "$BK_HTTPD" "$HTTPD_CONF"
+    fail "Config test failed."
   fi
-  [[ -n "$picked" ]] && echo "$picked" || return 1
-}
-VHCONF="$(pick_vhconf || true)"
-[[ -n "$VHCONF" ]] || { echo "vhost config not found for $DOMAIN under $LSWS_ROOT/conf/vhosts"; exit 1; }
+fi
 
-echo "[i] Using vhost config: $VHCONF"
-cp -a "$VHCONF" "$VHCONF.bak.$(date +%s)"
-EXT="dotnet_${DOMAIN//[^a-zA-Z0-9]/_}"
-
-# helper: upsert named blocks
-upsert() {
-  local FILE="$1" BEGIN="$2" END="$3" CONTENT="$4"
-  awk -v b="$BEGIN" -v e="$END" -v c="$CONTENT" '
-    BEGIN{inblk=0; found=0}
-    $0 ~ b {print c; inblk=1; found=1; next}
-    $0 ~ e {inblk=0; next}
-    inblk==1 {next}
-    {print}
-    END{if(found==0) print c}
-  ' "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+systemctl restart lsws || {
+  echo "[!] Restart failed. Restoring backups…"
+  cp -a "$BK_VHOST" "$VHCONF"
+  [[ -n "$BK_HTTPD" && -f "$BK_HTTPD" ]] && cp -a "$BK_HTTPD" "$HTTPD_CONF"
+  systemctl restart lsws || true
+  fail "OpenLiteSpeed did not restart."
 }
 
-# 1) extprocessor
-EXT_BEGIN="# BEGIN: auto-dotnet-extprocessor $EXT"
-EXT_END="# END: auto-dotnet-extprocessor $EXT"
-read -r -d '' EXT_BLOCK <<EOF || true
-$EXT_BEGIN
-extprocessor $EXT {
-  type                    proxy
-  address                 127.0.0.1:$PORT
-  maxConns                100
-  initTimeout             60
-  retryTimeout            0
-  pcKeepAliveTimeout      120
-}
-$EXT_END
-EOF
-upsert "$VHCONF" "$EXT_BEGIN" "$EXT_END" "$EXT_BLOCK"
-
-# 2) proxy context /
-CTX_BEGIN="# BEGIN: auto-dotnet-context-$EXT"
-CTX_END="# END: auto-dotnet-context-$EXT"
-read -r -d '' CTX_BLOCK <<EOF || true
-$CTX_BEGIN
-context / {
-  type                    proxy
-  handler                 $EXT
-  addDefaultCharset       off
-}
-$CTX_END
-EOF
-upsert "$VHCONF" "$CTX_BEGIN" "$CTX_END" "$CTX_BLOCK"
-
-# 3) explicit /ConnectionHub (helps some OLS builds)
-HUB_BEGIN="# BEGIN: auto-dotnet-context-ConnectionHub-$EXT"
-HUB_END="# END: auto-dotnet-context-ConnectionHub-$EXT"
-read -r -d '' HUB_BLOCK <<EOF || true
-$HUB_BEGIN
-context /ConnectionHub {
-  type                    proxy
-  handler                 $EXT
-  addDefaultCharset       off
-}
-$HUB_END
-EOF
-upsert "$VHCONF" "$HUB_BEGIN" "$HUB_END" "$HUB_BLOCK"
-
-# 4) ONE WebSocket rewrite (first clear any previous auto blocks to avoid dup braces)
-sed -i '/# BEGIN: auto-dotnet-websocket/,/# END: auto-dotnet-websocket/d' "$VHCONF"
-sed -i '/# BEGIN: auto-dotnet-websocket-strong/,/# END: auto-dotnet-websocket-strong/d' "$VHCONF"
-
-RWT_BEGIN="# BEGIN: auto-dotnet-websocket"
-RWT_END="# END: auto-dotnet-websocket"
-read -r -d '' RWT_BLOCK <<EOF || true
-$RWT_BEGIN
-rewrite  {
-  enable                  1
-  rewriteCond             %{HTTP:Connection} upgrade [NC]
-  rewriteCond             %{HTTP:Upgrade} websocket [NC]
-  rewriteRule             /(.*) ws://127.0.0.1:$PORT/\$1 [P,L]
-}
-$RWT_END
-EOF
-# append once at end (simple & reliable)
-printf "\n%s\n" "$RWT_BLOCK" >> "$VHCONF"
-
-# restart
-systemctl restart lsws
-echo "[ok] OLS wired for $DOMAIN → 127.0.0.1:$PORT (via $VHCONF)"
+echo "[ok] OLS wired for $DOMAIN → 127.0.0.1:$PORT (via $VHCONF). WS enabled."

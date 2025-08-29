@@ -555,7 +555,7 @@ main(){
   case "$cmd" in
     enable)      [[ $# -ge 1 ]] || err "Usage: enable <domain> [--dll <App.dll>] [--port N] [--vhconf /path/to/vhconf.conf]"; cmd_enable "$@";;
     redeploy)    cmd_redeploy "$@";;
-    status)      [[ # -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
+    status)      [[ $# -ge 1 ]] || err "Usage: status <domain>"; cmd_status "$@";;
     logs)        [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
     port)        [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
     disable)     [[ $# -ge 1 ]] || err "Usage: disable <domain> [--vhconf /path/to/vhconf.conf]"; cmd_disable "$@";;
@@ -567,3 +567,4 @@ main(){
   esac
 }
 main "$@"
+

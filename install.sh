@@ -1,62 +1,64 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ---------- Repo config ----------
 REPO="${REPO:-khalidrhb/cyberpanel-dotnet}"
 BRANCH="${BRANCH:-main}"
 
-# ---------- Install targets ----------
 PREFIX="${PREFIX:-/usr/local/bin}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 ENV_DIR="${ENV_DIR:-/etc/dotnet-apps}"
 
-# ---------- Payload lists ----------
 SCRIPTS=(cyberpanel-dotnet cyberpanel-dotnet-proxy cyberpanel-dotnet-wrapper dotnet-autodeploy)
 UNITS=(dotnet-app@.service dotnet-autodeploy.service dotnet-autodeploy.timer dotnet-apps.path)
 
-# ---------- Helpers ----------
 here_is_repo() { [[ -d scripts && -d systemd && -f scripts/cyberpanel-dotnet ]]; }
 
-raw_url() {
-  local path="${1:?path required}"
-  printf "https://raw.githubusercontent.com/%s/%s/%s" "$REPO" "$BRANCH" "$path"
+raw_url(){ printf "https://raw.githubusercontent.com/%s/%s/%s" "$REPO" "$BRANCH" "$1"; }
+fetch_raw(){
+  local repo_path="${1:?repo_path required}" dst="${2:?dst required}"
+  echo "[i] Fetching $(raw_url "$repo_path")"
+  curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 "$(raw_url "$repo_path")" -o "$dst"
+  [[ -s "$dst" ]] || { echo "[ERROR] Failed to download: $repo_path" >&2; exit 1; }
 }
 
-fetch_raw() {
-  local repo_path="${1:?repo_path required}"
-  local dst="${2:?dst required}"
-  local url; url="$(raw_url "$repo_path")"
-  echo "[i] Fetching $url"
-  curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 "$url" -o "$dst"
-  [[ -s "$dst" ]] || { echo "[ERROR] Download failed: $repo_path" >&2; exit 1; }
+normalize_unix(){
+  # Strip CRLF; ensure newline at EOF
+  sed -i 's/\r$//' "$1" || true
+  tail -c1 "$1" | read -r _ || echo >> "$1"
 }
 
-copy_or_fetch() {
-  # $1: repo path   $2: dst path   $3: mode
-  local repo_path="${1:?repo_path required}"
-  local dst="${2:?dst required}"
-  local mode="${3:-0644}"
+maybe_shell_check(){
+  # Only syntax-check our shell scripts
+  case "$1" in
+    */cyberpanel-dotnet|*/cyberpanel-dotnet-proxy|*/cyberpanel-dotnet-wrapper|*/dotnet-autodeploy)
+      bash -n "$1" || { echo "[ERROR] Shell syntax check failed for $1" >&2; exit 1; }
+    ;;
+  esac
+}
+
+copy_or_fetch(){
+  # $1: repo path   $2: destination path   $3: mode
+  local repo_path="${1:?}" dst="${2:?}" mode="${3:-0644}"
   if here_is_repo && [[ -f "$repo_path" ]]; then
-    install -m "$mode" "$repo_path" "$dst"
+    cp "$repo_path" "$dst"
   else
     local tmp; tmp="$(mktemp)"
     fetch_raw "$repo_path" "$tmp"
-    install -m "$mode" "$tmp" "$dst"
-    rm -f "$tmp"
+    normalize_unix "$tmp"
+    maybe_shell_check "$tmp"
+    mv "$tmp" "$dst"
   fi
+  chmod "$mode" "$dst"
 }
 
-# ---------- Begin install ----------
 echo "[i] Preparing install dirs..."
 install -d -m 0755 "$PREFIX" "$ENV_DIR"
 
-# Scripts → PREFIX (0755)
 for f in "${SCRIPTS[@]}"; do
   copy_or_fetch "scripts/$f" "$PREFIX/$f" 0755
   echo "[i] Installed $PREFIX/$f"
 done
 
-# Systemd units → SYSTEMD_DIR (0644)
 for u in "${UNITS[@]}"; do
   copy_or_fetch "systemd/$u" "$SYSTEMD_DIR/$u" 0644
   echo "[i] Installed $SYSTEMD_DIR/$u"

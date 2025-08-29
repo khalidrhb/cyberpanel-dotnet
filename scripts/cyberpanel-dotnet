@@ -159,7 +159,6 @@ vhconf_for(){
     count=$((count+1))
   done < <(find "$VHOSTS_DIR" -maxdepth 2 -type f -name 'vhconf.conf' 2>/dev/null)
   if (( count == 1 )); then
-    # print the single one
     find "$VHOSTS_DIR" -maxdepth 2 -type f -name 'vhconf.conf' | grep -v '/Example/' | head -n1
     return
   fi
@@ -231,25 +230,60 @@ ols_reload(){
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
 }
 
+remove_root_contexts(){
+  local vhconf="$1"
+  local tmp; tmp="$(mktemp)"
+  awk -v B="$MARK_BEGIN" -v E="$MARK_END" '
+    BEGIN{del=0; depth=0; inroot=0}
+    $0~B{del=1; next}
+    $0~E{del=0; next}
+    /^[[:space:]]*context[[:space:]]*\/[[:space:]]*\{/ && del==0 {
+      inroot=1; depth=1; next
+    }
+    inroot==1 {
+      for(i=1;i<=length($0);i++){
+        c=substr($0,i,1)
+        if(c=="{")depth++
+        else if(c=="}"){depth--; if(depth==0){inroot=0; next}}
+      }
+      next
+    }
+    { print }
+  ' "$vhconf" > "$tmp"
+  mv "$tmp" "$vhconf"
+}
+
 inject_proxy_context(){
-  local vhconf="$1" port="$2"; local tmp
+  local vhconf="$1" port="$2"
   [[ -f "$vhconf" ]] || err "vhconf missing: $vhconf"
   cp -a "$vhconf" "$vhconf.bak.$(date +%s)"
-  tmp="$(mktemp)"
-  awk -v B="$MARK_BEGIN" -v E="$MARK_END" 'BEGIN{del=0} $0~B{del=1; next} $0~E{del=0; next} {if(!del) print $0}' "$vhconf" > "$tmp"
-  {
-    echo "$MARK_BEGIN"
-    echo "context / {"
-    echo "  type                    proxy"
-    echo "  handler                 http://127.0.0.1:$port"
-    echo "  addDefaultCharset       off"
-    echo "  maxConns                256"
-    echo "  rewrite                 0"
-    echo "  cacheEnable             0"
-    echo "}"
-    echo "$MARK_END"
-  } >> "$tmp"
+
+  # 1) Remove any existing root context blocks
+  remove_root_contexts "$vhconf"
+
+  # 2) Remove any previous managed block
+  local tmp; tmp="$(mktemp)"
+  awk -v B="$MARK_BEGIN" -v E="$MARK_END" '
+    BEGIN{del=0}
+    $0~B{del=1; next}
+    $0~E{del=0; next}
+    { if(!del) print }
+  ' "$vhconf" > "$tmp"
   mv "$tmp" "$vhconf"
+
+  # 3) Append our managed proxy root context
+  cat >>"$vhconf" <<EOF
+$MARK_BEGIN
+context / {
+  type                    proxy
+  handler                 http://127.0.0.1:$port
+  addDefaultCharset       off
+  maxConns                256
+  rewrite                 0
+  cacheEnable             0
+}
+$MARK_END
+EOF
 }
 
 remove_proxy_context(){

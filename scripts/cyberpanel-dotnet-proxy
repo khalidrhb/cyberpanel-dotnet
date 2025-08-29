@@ -1,65 +1,85 @@
 #!/usr/bin/env bash
 # Usage: sudo cyberpanel-dotnet-proxy <domain> <port>
-# Creates/updates:
-#   - extprocessor (proxy → 127.0.0.1:<port>)
-#   - proxy context /
-#   - WebSocket upgrade rule (SignalR)
+# Wires OpenLiteSpeed:
+#  - extprocessor (proxy → 127.0.0.1:<port>)
+#  - proxy context /
+#  - explicit /ConnectionHub context (SignalR)
+#  - WebSocket upgrade rewrite
+# Also ensures enableWebSocket 1 on :443 listeners.
 set -euo pipefail
 
 DOMAIN="${1:-}"; PORT="${2:-}"
 [[ -n "$DOMAIN" && -n "$PORT" ]] || { echo "Usage: $0 <domain> <port>"; exit 1; }
 
 LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
+HTTPD_CONF="$LSWS_ROOT/conf/httpd_config.conf"
 
-# --- auto-detect vhost dir/file for this domain ---
+require(){ command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }; }
+require awk
+
+# --- enable WebSockets in HTTPS listeners (:443), idempotent ---
+if [[ -f "$HTTPD_CONF" ]]; then
+  cp -a "$HTTPD_CONF" "$HTTPD_CONF.bak.$(date +%s)"
+  awk '
+    BEGIN{inL=0; d=0; isSSL=0; hasWS=0}
+    /^[[:space:]]*listener[[:space:]]+/ {inL=1; d=0; isSSL=0; hasWS=0}
+    {
+      if(inL){
+        if($0 ~ /\{/) d++
+        if($0 ~ /\}/) d--
+        if($0 ~ /address[[:space:]]*.*:443/) isSSL=1
+        if($0 ~ /secure[[:space:]]+1/) isSSL=1
+        if($0 ~ /^[[:space:]]*enableWebSocket[[:space:]]+1/) hasWS=1
+        if(d==0 && $0 ~ /\}/){
+          if(isSSL && !hasWS) print "  enableWebSocket         1"
+          inL=0
+        }
+      }
+      print $0
+    }
+  ' "$HTTPD_CONF" > "$HTTPD_CONF.tmp" && mv "$HTTPD_CONF.tmp" "$HTTPD_CONF"
+fi
+
+# --- locate vhost config for this domain ---
 pick_vhconf() {
   local base="$LSWS_ROOT/conf/vhosts"
-  local candidates=()
-
+  local cand=() picked=""
   [[ -d "$base" ]] || return 1
+  [[ -d "$base/$DOMAIN" ]] && cand+=("$base/$DOMAIN")
+  while IFS= read -r -d '' d; do cand+=("$d"); done \
+    < <(find "$base" -maxdepth 1 -type d -name "${DOMAIN}*" -print0 2>/dev/null || true)
 
-  # exact match first
-  [[ -d "$base/$DOMAIN" ]] && candidates+=("$base/$DOMAIN")
-
-  # any dir starting with the domain (domain-443, domain_SSL, etc.)
-  while IFS= read -r -d '' d; do candidates+=("$d"); done \
-    < <(find "$base" -maxdepth 1 -type d -name "$DOMAIN*" -print0 2>/dev/null || true)
-
-  # first pass: first existing conf in discovered dirs
-  local picked=""
-  for d in "${candidates[@]}"; do
-    [[ -f "$d/vhconf.conf" ]] && picked="$d/vhconf.conf" && break
-    [[ -f "$d/vhost.conf" ]] && picked="$d/vhost.conf" && break
+  for d in "${cand[@]}"; do
+    [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
+    [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
   done
-
-  # second pass: bias SSL/443 variants if none picked yet
-  if [[ -z "$picked" && ${#candidates[@]} -gt 0 ]]; then
-    for d in "${candidates[@]}"; do
+  if [[ -z "$picked" && ${#cand[@]} -gt 0 ]]; then
+    for d in "${cand[@]}"; do
       [[ "$d" =~ 443|SSL|ssl ]] || continue
       [[ -f "$d/vhconf.conf" ]] && { picked="$d/vhconf.conf"; break; }
-      [[ -f "$d/vhost.conf" ]] && { picked="$d/vhost.conf"; break; }
+      [[ -f "$d/vhost.conf"  ]] && { picked="$d/vhost.conf";  break; }
     done
   fi
-
   [[ -n "$picked" ]] && echo "$picked" || return 1
 }
-
 VHCONF="$(pick_vhconf || true)"
 [[ -n "$VHCONF" ]] || { echo "vhost config not found for $DOMAIN under $LSWS_ROOT/conf/vhosts"; exit 1; }
 
+echo "[i] Using vhost config: $VHCONF"
+cp -a "$VHCONF" "$VHCONF.bak.$(date +%s)"
 EXT="dotnet_${DOMAIN//[^a-zA-Z0-9]/_}"
-sudo cp -a "$VHCONF" "$VHCONF.bak.$(date +%Y%m%d-%H%M%S)"
 
+# helper: upsert named blocks
 upsert() {
   local FILE="$1" BEGIN="$2" END="$3" CONTENT="$4"
-  sudo awk -v b="$BEGIN" -v e="$END" -v c="$CONTENT" '
+  awk -v b="$BEGIN" -v e="$END" -v c="$CONTENT" '
     BEGIN{inblk=0; found=0}
     $0 ~ b {print c; inblk=1; found=1; next}
     $0 ~ e {inblk=0; next}
     inblk==1 {next}
     {print}
     END{if(found==0) print c}
-  ' "$FILE" > "${FILE}.tmp" && sudo mv "${FILE}.tmp" "$FILE"
+  ' "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
 }
 
 # 1) extprocessor
@@ -93,19 +113,39 @@ $CTX_END
 EOF
 upsert "$VHCONF" "$CTX_BEGIN" "$CTX_END" "$CTX_BLOCK"
 
-# 3) WebSocket upgrade (SignalR)
-RWT_BEGIN="# BEGIN: auto-dotnet-websocket-$EXT"
-RWT_END="# END: auto-dotnet-websocket-$EXT"
+# 3) explicit /ConnectionHub (helps some OLS builds)
+HUB_BEGIN="# BEGIN: auto-dotnet-context-ConnectionHub-$EXT"
+HUB_END="# END: auto-dotnet-context-ConnectionHub-$EXT"
+read -r -d '' HUB_BLOCK <<EOF || true
+$HUB_BEGIN
+context /ConnectionHub {
+  type                    proxy
+  handler                 $EXT
+  addDefaultCharset       off
+}
+$HUB_END
+EOF
+upsert "$VHCONF" "$HUB_BEGIN" "$HUB_END" "$HUB_BLOCK"
+
+# 4) ONE WebSocket rewrite (first clear any previous auto blocks to avoid dup braces)
+sed -i '/# BEGIN: auto-dotnet-websocket/,/# END: auto-dotnet-websocket/d' "$VHCONF"
+sed -i '/# BEGIN: auto-dotnet-websocket-strong/,/# END: auto-dotnet-websocket-strong/d' "$VHCONF"
+
+RWT_BEGIN="# BEGIN: auto-dotnet-websocket"
+RWT_END="# END: auto-dotnet-websocket"
 read -r -d '' RWT_BLOCK <<EOF || true
 $RWT_BEGIN
 rewrite  {
   enable                  1
-  rewriteCond             %{HTTP:Upgrade} =websocket [NC]
+  rewriteCond             %{HTTP:Connection} upgrade [NC]
+  rewriteCond             %{HTTP:Upgrade} websocket [NC]
   rewriteRule             /(.*) ws://127.0.0.1:$PORT/\$1 [P,L]
 }
 $RWT_END
 EOF
-upsert "$VHCONF" "$RWT_BEGIN" "$RWT_END" "$RWT_BLOCK"
+# append once at end (simple & reliable)
+printf "\n%s\n" "$RWT_BLOCK" >> "$VHCONF"
 
-sudo systemctl restart lsws
-echo "OK: OLS wired for $DOMAIN → 127.0.0.1:$PORT via $VHCONF"
+# restart
+systemctl restart lsws
+echo "[ok] OLS wired for $DOMAIN → 127.0.0.1:$PORT (via $VHCONF)"

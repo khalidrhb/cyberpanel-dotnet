@@ -304,43 +304,82 @@ fix_listener_mappings(){
   cp -a "$httpdc" "$httpdc.bak.$(date +%s)"
 
   awk -v VH="$vhname" -v D1="$d1" -v D2="$d2" '
-    BEGIN{in=0; addr=""; sec="0"; printed=0}
-    /^[[:space:]]*listener[[:space:]]+/ { in=1; addr=""; sec="0"; printed=0; print; next }
-    in==1 && /^[[:space:]]*address[[:space:]]+/ { addr=$2; print; next }
-    in==1 && /^[[:space:]]*secure[[:space:]]+/  { sec=$2; print; next }
-    in==1 && /^[[:space:]]*map[[:space:]]+/ {
-      # If this line mentions our domains, replace it with our mapping once
-      if ($0 ~ D1 || $0 ~ D2) {
-        if (!printed) { printf("  map  %s  %s %s\n", VH, D1, D2); printed=1; }
+    BEGIN{
+      in=0; addr=""; sec="0"; hasmap=0
+    }
+    {
+      line=$0
+
+      # Entering a listener block
+      if (line ~ /^[[:space:]]*listener[[:space:]]+/) {
+        in=1; addr=""; sec="0"; hasmap=0
+        print line
         next
       }
-      print; next
+
+      if (in==1) {
+        # Capture address
+        if (line ~ /^[[:space:]]*address[[:space:]]+/) {
+          n=split(line, a, /[[:space:]]+/)
+          if (n>=2) addr=a[2]
+          print line
+          next
+        }
+        # Capture secure flag
+        if (line ~ /^[[:space:]]*secure[[:space:]]+/) {
+          n=split(line, a, /[[:space:]]+/)
+          if (n>=2) sec=a[2]
+          print line
+          next
+        }
+        # Handle map lines
+        if (line ~ /^[[:space:]]*map[[:space:]]+/) {
+          if (index(line, D1)>0 || index(line, D2)>0) {
+            if (hasmap==0) {
+              print "  map  " VH "  " D1 " " D2
+              hasmap=1
+            }
+            next  # drop the original domain mapping line
+          }
+          print line
+          next
+        }
+        # Closing brace of listener: ensure our map exists when needed
+        if (line ~ /^\}/) {
+          need=0
+          if (addr ~ /:80/ || addr ~ /\*:80/ || addr ~ /0\.0\.0\.0:80/ || addr ~ /\[::\]:80/) need=1
+          if (sec=="1" || addr ~ /:443/ || addr ~ /\*:443/ || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
+          if (need==1 && hasmap==0) {
+            print "  map  " VH "  " D1 " " D2
+          }
+          in=0; addr=""; sec="0"; hasmap=0
+          print line
+          next
+        }
+      }
+
+      # Default passthrough
+      print line
     }
-    in==1 && /^\}/ {
-      # Ensure a mapping exists for :80 and :443/secure listeners
-      need=0
-      if (addr ~ /:80/ || addr ~ /\*:80/ || addr ~ /0\.0\.0\.0:80/ || addr ~ /\[::\]:80/) need=1
-      if (sec=="1" || addr ~ /:443/ || addr ~ /\*:443/ || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
-      if (need && !printed) { printf("  map  %s  %s %s\n", VH, D1, D2); printed=1; }
-      in=0; print; next
-    }
-    { print }
   ' "$httpdc" > /tmp/httpd_config.conf.new
 
   mv /tmp/httpd_config.conf.new "$httpdc"
   ols_reload
 
   echo "--- Listener mappings for $domain ---"
-  awk '
+  awk -v D1="$d1" -v D2="$d2" '
     BEGIN{L="";A="";S="0"}
     /^[[:space:]]*listener[[:space:]]+/ {L=$2; A=""; S="0"}
-    /^[[:space:]]*address[[:space:]]+/ {A=$2}
-    /^[[:space:]]*secure[[:space:]]+/  {S=$2}
-    /^[[:space:]]*map[[:space:]]+/ && ($0 ~ /'"$d1"'/ || $0 ~ /'"$d2"'/) {
-      printf("listener=%s  address=%s  secure=%s  %s\n", L, A, S, $0)
+    /^[[:space:]]*address[[:space:]]+/ {split($0,a,/[[:space:]]+/); A=a[2]}
+    /^[[:space:]]*secure[[:space:]]+/  {split($0,a,/[[:space:]]+/); S=a[2]}
+    /^[[:space:]]*map[[:space:]]+/ {
+      if (index($0,D1)>0 || index($0,D2)>0) {
+        printf("listener=%s  address=%s  secure=%s  %s\n", L, A, S, $0)
+      }
     }
   ' "$httpdc" || true
 }
+
 
 # ---------- systemd ----------
 create_service(){

@@ -1,57 +1,25 @@
 #!/usr/bin/env bash
-# Auto OLS wiring wrapper for cyberpanel-dotnet
-# - Always wires OLS (proxy + WebSockets) on `enable`
+# Auto OLS wiring on `enable` (no prompt)
 set -euo pipefail
 
 REAL="/usr/local/bin/cyberpanel-dotnet-real"
 PROXY_HELPER="/usr/local/bin/cyberpanel-dotnet-proxy"
-LSWS_ROOT="${LSWS_ROOT:-/usr/local/lsws}"
-HTTPD_CONF="$LSWS_ROOT/conf/httpd_config.conf"
 
-require() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }; }
-
-enable_ws_on_https_listeners() {
-  [[ -f "$HTTPD_CONF" ]] || return 0
-  cp -a "$HTTPD_CONF" "$HTTPD_CONF.bak.$(date +%s)"
-  awk '
-    BEGIN{inL=0; depth=0; isSSL=0; hasWS=0}
-    /^[[:space:]]*listener[[:space:]]+/ {inL=1; depth=0; isSSL=0; hasWS=0}
-    {
-      if(inL){
-        if($0 ~ /\{/) depth++
-        if($0 ~ /\}/) depth--
-        if($0 ~ /address[[:space:]]*.*:443/) isSSL=1
-        if($0 ~ /secure[[:space:]]+1/) isSSL=1
-        if($0 ~ /^[[:space:]]*enableWebSocket[[:space:]]+1/) hasWS=1
-        if(depth==0 && $0 ~ /\}/){
-          if(isSSL && !hasWS) print "  enableWebSocket         1"
-          inL=0
-        }
-      }
-      print $0
-    }
-  ' "$HTTPD_CONF" > "$HTTPD_CONF.tmp" && mv "$HTTPD_CONF.tmp" "$HTTPD_CONF"
-}
+require(){ command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }; }
 
 auto_wire_ols() {
   local domain="$1"
   require "$REAL"
+  require "$PROXY_HELPER"
   local port
   port="$(sudo "$REAL" port "$domain" | tr -d $'\r\n')" || true
   [[ -n "$port" ]] || { echo "[error] Could not determine Kestrel port for $domain"; exit 1; }
-
-  require "$PROXY_HELPER"
   sudo "$PROXY_HELPER" "$domain" "$port"
-
-  enable_ws_on_https_listeners
-  systemctl restart lsws || true
-  echo "[ok] OLS wired for $domain (proxy → 127.0.0.1:$port, WebSockets enabled)"
 }
 
-# ---- main dispatch ----
 if [[ "${1:-}" == "enable" && $# -ge 4 ]]; then
   domain="$2"
-  "$REAL" "$@"    # run the real enable
+  "$REAL" "$@"
   auto_wire_ols "$domain"
   exit 0
 fi

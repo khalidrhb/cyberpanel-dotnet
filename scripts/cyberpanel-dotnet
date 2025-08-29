@@ -55,17 +55,13 @@ docroot_from_vhconf(){
   return 1
 }
 
-# Map finder: read listener "map" lines anywhere in $CONF_DIR to resolve domain -> vhost name
+# Parse listener "map" lines anywhere in $CONF_DIR to resolve domain -> vhost name
 _vhname_from_map(){
   local domain="$1"
   local f line name
   shopt -s nullglob
-  # Search all *.conf (including httpd_config.conf and listener confs)
   while IFS= read -r -d '' f; do
-    # lines like:  map   myVHost   flezora.com,www.flezora.com
-    # or:          map   myVHost   *
     while IFS= read -r line; do
-      # Does the line contain our domain?
       echo "$line" | grep -qi -- "$domain" || continue
       name=$(awk 'BEGIN{IGNORECASE=1}
         /^[[:space:]]*map[[:space:]]+/ {
@@ -74,25 +70,24 @@ _vhname_from_map(){
           }
         }' <<<"$line")
       if [[ -n "$name" ]]; then
-        echo "$name"
-        return 0
+        echo "$name"; return 0
       fi
     done < <(grep -iE '^[[:space:]]*map[[:space:]]+' "$f" 2>/dev/null || true)
   done < <(find "$CONF_DIR" -type f -name "*.conf" -print0 2>/dev/null)
   return 1
 }
 
-# Robust vhost finder:
+# Robust vhost finder (safe for set -u):
 #  1) exact folder match: $VHOSTS_DIR/<domain>/vhconf.conf
-#  2) parse listener map lines to resolve domain -> vhName, then build vhost path
-#  3) search by docRoot == /home/<domain>/public_html (quoted or not) across both $VHOSTS_DIR and $CONF_DIR
-#  4) docRoot contains domain + ends with public_html
-#  5) any vhconf.conf path containing the domain
-#  6) allow manual override via 2nd param
+#  2) listener map lines -> vhost name
+#  3) search by docRoot == /home/<domain>/public_html across $VHOSTS_DIR and $CONF_DIR
+#  4) docRoot contains the domain AND ends with public_html
+#  5) path contains the domain
+#  6) manual override via 2nd param
 vhconf_for(){
   local domain="$1"
   local override="${2:-}"
-  [[ -n "$override" && -f "$override" ]] && { echo "$override"; return; }
+  if [[ -n "$override" && -f "$override" ]]; then echo "$override"; return; fi
 
   local candidate=""
   local exact_dr; exact_dr=$(trim_slash "/home/$domain/public_html")
@@ -102,14 +97,16 @@ vhconf_for(){
   if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
 
   # 2) listener map -> vhName
-  local vhname
-  if vhname=$(_vhname_from_map "$domain"); then
-    candidate="$VHOSTS_DIR/$vhname/vhconf.conf"
-    if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
+  local vhname=""
+  if vhname=$(_vhname_from_map "$domain" || true); then
+    if [[ -n "$vhname" ]]; then
+      candidate="$VHOSTS_DIR/$vhname/vhconf.conf"
+      if [[ -f "$candidate" ]]; then echo "$candidate"; return; fi
+    fi
   fi
 
-  # 3) docRoot exact
-  local d dr hit_sub hit_path
+  # 3,4,5) scan for docRoot or path matches
+  local d="" f="" dr="" hit_sub="" hit_path=""
   for d in "$VHOSTS_DIR" "$CONF_DIR"; do
     [[ -d "$d" ]] || continue
     while IFS= read -r -d '' f; do
@@ -117,21 +114,21 @@ vhconf_for(){
       if [[ -n "$dr" && "$(trim_slash "$dr")" == "$exact_dr" ]]; then
         echo "$f"; return
       fi
-      # 4) loose docRoot match: mentions domain and public_html
       if [[ -z "$hit_sub" && -n "$dr" ]]; then
         if echo "$dr" | grep -qiE "/${domain}(/|.*)public_html/?$"; then
           hit_sub="$f"
         fi
       fi
-      # 5) path contains domain
       if [[ -z "$hit_path" ]]; then
-        echo "$f" | grep -qi "/${domain}.*vhconf\.conf$" && hit_path="$f"
+        if echo "$f" | grep -qi "/${domain}.*vhconf\.conf$"; then
+          hit_path="$f"
+        fi
       fi
     done < <(find "$d" -type f -name 'vhconf.conf' -print0 2>/dev/null)
   done
 
-  [[ -n "$hit_sub"  ]] && { echo "$hit_sub";  return; }
-  [[ -n "$hit_path" ]] && { echo "$hit_path"; return; }
+  if [[ -n "$hit_sub" ]]; then echo "$hit_sub"; return; fi
+  if [[ -n "$hit_path" ]]; then echo "$hit_path"; return; fi
 
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR or $CONF_DIR.
 Hints:
@@ -203,7 +200,6 @@ inject_proxy_context(){
   [[ -f "$vhconf" ]] || err "vhconf missing: $vhconf"
   cp -a "$vhconf" "$vhconf.bak.$(date +%s)"
   tmp=$(mktemp)
-  # Remove previous managed block (if present)
   awk -v B="$MARK_BEGIN" -v E="$MARK_END" 'BEGIN{del=0} $0~B{del=1; next} $0~E{del=0; next} {if(!del) print $0}' "$vhconf" > "$tmp"
   {
     echo "$MARK_BEGIN"

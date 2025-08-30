@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 shopt -s extglob nullglob
 
-# ---------- UI helpers ----------
+# ===== UI helpers =====
 red(){ echo -e "\e[31m$*\e[0m"; }
 grn(){ echo -e "\e[32m$*\e[0m"; }
 yel(){ echo -e "\e[33m$*\e[0m"; }
@@ -11,7 +11,7 @@ info(){ echo "[i] $*"; }
 sudo_ok(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || err "Run as root (sudo)."; }
 need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1 (please install it)"; }
 
-# ---------- Globals ----------
+# ===== Globals =====
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/dotnet-apps"
 STATE_DIR="/etc/cyberpanel-dotnet"
@@ -26,13 +26,13 @@ CONF_DIR=""
 
 mkdir -p "$STATE_DIR" "$ENV_DIR"
 
-# ---------- ID helpers ----------
+# ===== ID helpers =====
 sanitize_id(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'; }
 service_name(){ local id; id=$(sanitize_id "$1"); echo "dotnet-app@${id}.service"; }
 service_path(){ echo "$SYSTEMD_DIR/$(service_name "$1")"; }
 envfile_path(){ local id; id=$(sanitize_id "$1"); echo "$ENV_DIR/${id}.env"; }
 
-# ---------- OpenLiteSpeed discovery ----------
+# ===== OpenLiteSpeed discovery =====
 _detect_lsws_root(){
   if [[ -n "${LSWS_ROOT:-}" && -x "${LSWS_ROOT}/bin/lswsctrl" ]]; then echo "$LSWS_ROOT"; return; fi
   if [[ -x "/usr/local/lsws/bin/lswsctrl" ]]; then echo "/usr/local/lsws"; return; fi
@@ -154,7 +154,7 @@ workdir_for_domain(){
   echo "$guess"
 }
 
-# ---------- dotnet + port helpers ----------
+# ===== dotnet + port helpers =====
 find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
 
 get_port_from_service(){
@@ -175,6 +175,7 @@ get_port_from_service(){
 }
 
 port_in_use(){ ss -ltnH | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"; }
+
 alloc_port(){
   local domain="$1"
   local seed=$(( ( $(echo -n "$domain" | md5sum | cut -c1-6 | tr 'a-f' '1-6') % 1000 ) + PORT_RANGE_START ))
@@ -197,7 +198,7 @@ resolve_dll_from_marker(){
 resolve_dll(){
   local workdir="$1"; local dll="${2:-}"
   if [[ -z "$dll" ]]; then
-    if dll="$(resolve_dll_from_marker "$workdir")"; then :; else err "--dll <App.dll> is required (or put DLL=YourApp.dll)"; fi
+    if dll="$(resolve_dll_from_marker "$workdir")"; then :; else err "--dll <App.dll> is required (or put DLL=YourApp.dll in .dotnet)"; fi
   fi
   if [[ "$dll" = /* && -f "$dll" ]]; then echo "$dll"; return; fi
   if [[ -f "$workdir/$dll" ]]; then echo "$workdir/$dll"; return; fi
@@ -208,7 +209,7 @@ resolve_dll(){
   err "DLL '$dll' not found under '$workdir'. Upload your published files to the site's document root."
 }
 
-# ---------- OLS integration ----------
+# ===== OLS integration =====
 ols_reload(){
   if [[ -x "$LSWS_ROOT/bin/lswsctrl" ]]; then "$LSWS_ROOT/bin/lswsctrl" reload || true; fi
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
@@ -254,12 +255,23 @@ $MARK_END
 EOF
 }
 
-remove_proxy_context(){
-  local vhconf="$1"
-  [[ -f "$vhconf" ]] || return 0
-  cp -a "$vhconf" "$vhconf.bak.$(date +%s)"
-  awk -v B="$MARK_BEGIN" -v E="$MARK_END" 'BEGIN{drop=0} $0~B{drop=1; next} $0~E{drop=0; next} {if(!drop) print $0}' "$vhconf" > "$vhconf.tmp"
-  mv "$vhconf.tmp" "$vhconf"
+# Ensure vhDomain contains domain + www.domain in the vhost conf
+ensure_vh_domain(){
+  local domain="$1" vhconf="$2"
+  local d1="$domain" d2="www.$domain"
+  if grep -qiE '^[[:space:]]*vhDomain[[:space:]]+' "$vhconf"; then
+    # merge if missing
+    local line; line="$(grep -iE '^[[:space:]]*vhDomain[[:space:]]+' "$vhconf" | head -n1)"
+    local rest="${line#*vhDomain}"; rest="$(echo "$rest" | tr -d '\r')"
+    # normalize commas/spaces
+    rest="$(echo "$rest" | tr ',' ' ' | xargs -n1 echo | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+    echo "$rest" | grep -qw "$d1" || rest="$rest $d1"
+    echo "$rest" | grep -qw "$d2" || rest="$rest $d2"
+    rest="$(echo "$rest" | xargs | tr ' ' ',')"
+    sed -i "0,/^[[:space:]]*vhDomain[[:space:]]\+.*$/s//vhDomain $rest/" "$vhconf"
+  else
+    printf '\n# added by cyberpanel-dotnet\nvhDomain %s, %s\n' "$d1" "$d2" >> "$vhconf"
+  fi
 }
 
 # Ensure mapping in listeners for domain + www.domain (portable awk)
@@ -283,17 +295,15 @@ fix_listener_mappings(){
         if (line ~ /^[ \t]*address[ \t]+/) { tmp=line; gsub(/^[ \t]*address[ \t]+/, "", tmp); split(tmp,a,/[ \t]/); addr=a[1]; print $0; next }
         if (line ~ /^[ \t]*secure[ \t]+/)  { tmp=line; gsub(/^[ \t]*secure[ \t]+/,  "", tmp); split(tmp,a,/[ \t]/); sec=a[1];  print $0; next }
         if (line ~ /^[ \t]*map[ \t]+/) {
-          if (index(line, D1)>0 || index(line, D2)>0) {
-            if (hasmap==0) { print "  map  " VH "  " D1 " " D2; hasmap=1 }
-            next
-          }
+          if (index(line, D1)>0 || index(line, D2)>0) { hasmap=1; /* drop old dup */ next }
           print $0; next
         }
         if (line ~ /^[ \t]*}/) {
           need=0
+          # need mapping for :80 or any https (secure 1 or addr :443)
           if (addr ~ /:80/  || addr ~ /\*:80/  || addr ~ /0\.0\.0\.0:80/  || addr ~ /\[::\]:80/)  need=1
           if (sec=="1"     || addr ~ /:443/   || addr ~ /\*:443/         || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
-          if (need==1 && hasmap==0) { print "  map  " VH "  " D1 " " D2 }
+          if (need==1) { print "  map  " VH "  " D1 " " D2 }
           blk=0; addr=""; sec="0"; hasmap=0
           print $0; next
         }
@@ -319,7 +329,7 @@ fix_listener_mappings(){
   ' "$httpdc" || true
 }
 
-# ---------- systemd ----------
+# ===== systemd =====
 create_service(){
   local domain="$1" workdir="$2" port="$3" absdll="$4"
   local svc; svc="$(service_path "$domain")"
@@ -356,7 +366,7 @@ WantedBy=multi-user.target
 UNIT
 }
 
-# ---------- Preflight ----------
+# ===== Preflight =====
 autodetect(){
   sudo_ok
   need awk; need sed; need ss; need find; need grep
@@ -377,8 +387,8 @@ preflight_domain(){
   [[ -d "$wd" ]] || err "Document root '$wd' does not exist for $domain"
 }
 
-# ---------- Commands ----------
-usage(){ cat <<USAGE
+# ===== Commands =====
+usage(){ cat <<'USAGE'
 cyberpanel-dotnet — manage .NET apps on CyberPanel/OpenLiteSpeed
 
 Commands:
@@ -464,10 +474,13 @@ cmd_enable(){
   systemctl enable "$(service_name "$domain")"
   systemctl restart "$(service_name "$domain")"
 
+  # vhost side: de-dup contexts and inject proxy
   inject_proxy_context "$vh" "$port"
+  # ensure vhost declares domains
+  ensure_vh_domain "$domain" "$vh"
   ols_reload
 
-  # Auto-fix listener mappings (HTTP+HTTPS) for this domain -> this vhost
+  # server side: ensure listener mappings (HTTP+HTTPS)
   fix_listener_mappings "$domain" "$vh"
 
   local unit; unit="$(service_name "$domain")"
@@ -519,7 +532,7 @@ cmd_logs(){
   autodetect
   local domain="$1"; shift || true
   [[ -n "$domain" ]] || err "Domain required"
-  local lines=""; local follow=""
+  local lines="-n 200"; local follow=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--follow) follow="-f"; shift;;
@@ -597,12 +610,13 @@ cmd_fixmap(){
   done
   autodetect; preflight_domain "$domain" "$vh_override"
   local vh; vh="$(vhconf_for "$domain" "$vh_override")"
+  ensure_vh_domain "$domain" "$vh"
   fix_listener_mappings "$domain" "$vh"
   grn "Mappings ensured for $domain → $(basename "$(dirname "$vh")")."
-  echo "Tip: test via  curl -k -I https://$domain  and  curl -k -I http://$domain"
+  echo "Tip: test via  curl -k -I https://$domain  and  curl -I http://$domain"
 }
 
-# ---------- Entry ----------
+# ===== Entry =====
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in

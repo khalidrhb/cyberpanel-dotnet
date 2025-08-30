@@ -79,18 +79,76 @@ _expand_vars(){
   echo "$raw"
 }
 
+# Replace your existing docroot_from_vhconf() with this:
 docroot_from_vhconf(){
   local vhconf="$1"
-  local dr
-  dr="$(awk '/^[ \t]*docRoot[ \t]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
-  dr="${dr%\"}"; dr="${dr#\"}"
-  [[ -z "$dr" ]] && return 1
-  dr="$(_expand_vars "$dr" "$vhconf")"
-  dr="${dr%\"}"; dr="${dr#\"}"
-  dr="$(trim_slash "$dr")"
-  [[ -n "$dr" ]] && echo "$dr" && return 0
-  return 1
+  # raw docRoot token (may contain variables)
+  local raw
+  raw="$(awk '/^[ \t]*docRoot[ \t]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
+  raw="${raw%\"}"; raw="${raw#\"}"
+
+  # vhost name (folder name)
+  local vhname; vhname="$(basename "$(dirname "$vhconf")")"
+
+  # resolve vhRoot first (it may contain $SERVER_ROOT / $VH_NAME)
+  local vhroot
+  vhroot="$(awk '/^[ \t]*vhRoot[ \t]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
+  vhroot="${vhroot%\"}"; vhroot="${vhroot#\"}"
+  if [[ -n "$vhroot" ]]; then
+    vhroot="${vhroot//\$SERVER_ROOT/$LSWS_ROOT}"
+    vhroot="${vhroot//\$VH_NAME/$vhname}"
+  fi
+
+  # expand variables in docRoot
+  local dr="$raw"
+  dr="${dr//\$VH_ROOT/$vhroot}"
+  dr="${dr//\$SERVER_ROOT/$LSWS_ROOT}"
+  dr="${dr//\$VH_NAME/$vhname}"
+  # collapse accidental doubles and trim trailing slash
+  dr="$(echo "$dr" | sed -E 's@//+@/@g')"
+  dr="${dr%/}"
+
+  # if expansion failed (common when vhRoot parsing failed), fix it sanely
+  if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" ]]; then
+    # try to pick first hostname from vhDomain; fall back to folder name
+    local dguess
+    dguess="$(awk '/^[ \t]*vhDomain[ \t]+/{
+                    for(i=2;i<=NF;i++){gsub(/,|"/,"",$i); if($i!="") {print $i; exit} }
+                  }' "$vhconf" 2>/dev/null || true)"
+    [[ -z "$dguess" ]] && dguess="$vhname"
+    dr="/home/$dguess/public_html"
+  fi
+
+  echo "$dr"
 }
+
+# Replace your existing workdir_for_domain() with this:
+workdir_for_domain(){
+  local domain="$1"
+  local override="${2:-}"
+  local vh
+  vh="$(vhconf_for "$domain" "$override")" || exit 1
+
+  local dr
+  dr="$(docroot_from_vhconf "$vh" || true)"
+
+  # harden: if docRoot still looks wrong, use canonical /home/<domain>/public_html
+  if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" ]]; then
+    dr="/home/$domain/public_html"
+  fi
+
+  if [[ -d "$dr" ]]; then
+    echo "$dr"; return
+  fi
+
+  # last-resort hunt under /home
+  local guess
+  guess="$(find /home -maxdepth 3 -type d -path "/home/*/public_html" 2>/dev/null | grep "/$domain/" -m1 || true)"
+  [[ -n "$guess" ]] && { echo "$guess"; return; }
+
+  err "Could not find document root for '$domain'. Ensure the website exists and try again."
+}
+
 
 # Resolve vhost name from listener map lines in httpd_config.conf
 _vhname_from_map(){

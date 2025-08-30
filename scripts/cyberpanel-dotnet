@@ -287,21 +287,43 @@ fix_listener_mappings(){
   cp -a "$httpdc" "$httpdc.bak.$(date +%s)"
 
   awk -v VH="$vhname" -v D1="$d1" -v D2="$d2" '
-    BEGIN { blk=0; addr=""; sec="0"; hasmap=0 }
+    BEGIN { blk=0; addr=""; sec="0" }
     {
       line=$0
-      if (line ~ /^[ \t]*listener[ \t]+/) { blk=1; addr=""; sec="0"; hasmap=0; print line; next }
+
+      # start of a listener block
+      if (line ~ /^[ \t]*listener[ \t]+/) {
+        blk=1; addr=""; sec="0"
+        print line
+        next
+      }
+
       if (blk==1) {
-        if (line ~ /^[ \t]*address[ \t]+/) { tmp=line; gsub(/^[ \t]*address[ \t]+/, "", tmp); split(tmp,a,/[ \t]/); addr=a[1]; print $0; next }
-        if (line ~ /^[ \t]*secure[ \t]+/)  { tmp=line; gsub(/^[ \t]*secure[ \t]+/,  "", tmp); split(tmp,a,/[ \t]/); sec=a[1];  print $0; next }
+        # capture address
+        if (line ~ /^[ \t]*address[ \t]+/) {
+          tmp=line; sub(/^[ \t]*address[ \t]+/, "", tmp)
+          split(tmp, a, /[ \t]/)
+          addr=a[1]
+          print $0
+          next
+        }
+        # capture secure flag
+        if (line ~ /^[ \t]*secure[ \t]+/) {
+          tmp=line; sub(/^[ \t]*secure[ \t]+/, "", tmp)
+          split(tmp, a, /[ \t]/)
+          sec=a[1]
+          print $0
+          next
+        }
+        # drop any existing map lines for our domain(s)
         if (line ~ /^[ \t]*map[ \t]+/) {
           if (index(line, D1)>0 || index(line, D2)>0) {
-            hasmap=1    # drop old dup by skipping this line
             next
           }
           print $0
           next
         }
+        # end of listener: add exactly one canonical map if it’s an HTTP/HTTPS listener
         if (line ~ /^[ \t]*}/) {
           need=0
           if (addr ~ /:80/  || addr ~ /\*:80/  || addr ~ /0\.0\.0\.0:80/  || addr ~ /\[::\]:80/)  need=1
@@ -309,11 +331,13 @@ fix_listener_mappings(){
           if (need==1) {
             print "  map  " VH "  " D1 " " D2
           }
-          blk=0; addr=""; sec="0"; hasmap=0
+          blk=0; addr=""; sec="0"
           print $0
           next
         }
       }
+
+      # pass-through
       print $0
     }
   ' "$httpdc" > /tmp/httpd_config.conf.new

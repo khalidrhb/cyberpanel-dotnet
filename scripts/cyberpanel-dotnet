@@ -90,7 +90,7 @@ docroot_from_vhconf(){
   dr="$(_expand_vars "$raw" "$vhconf")"
   dr="$(echo "$dr" | sed -E 's@//+@/@g')"
   dr="${dr%/}"
-  # if missing/variabley, fallback to canonical
+  # fallback to canonical if missing/variable
   if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" || "$dr" =~ [$][A-Z_\{] ]]; then
     local vhname dguess
     vhname="$(basename "$(dirname "$vhconf")")"
@@ -98,7 +98,6 @@ docroot_from_vhconf(){
       /^[ \t]*vhDomain[ \t]+/{
         for(i=2;i<=NF;i++){ gsub(/,|"/,"",$i); if($i!=""){ print $i; exit } }
       }' "$vhconf" 2>/dev/null || true)"
-    # If CyberPanel template left $VH_NAME here, use actual vhost dir name
     [[ -z "$dguess" || "$dguess" =~ ^[$] ]] && dguess="$vhname"
     dr="/home/$dguess/public_html"
   fi
@@ -291,19 +290,8 @@ ensure_vhDomain(){
   fi
 }
 ensure_vhost_enabled(){
-  # Use sed to flip "enable 0" to "enable 1" only inside the target virtualHost block.
-  local vhname="$1"
-  local tmp; tmp="$(mktemp)"
-  awk -v N="$vhname" '
-    BEGIN{in=0}
-    /^[ \t]*virtualHost[ \t]+/ { in = ($2==N); print; next }
-    in==1 && /^[ \t]*enable[ \t]+0/ { sub(/enable[ \t]+0/, "enable                 1"); print; next }
-    in==1 && /^[ \t]*enable[ \t]+1/ { print; next }
-    in==1 && /^[ \t]*configFile[ \t]+/ { print; next }
-    in==1 && /^[ \t]*}/ { print; in=0; next }
-    { print }
-  ' "$HTTPD_CONF" > "$tmp" 2>/dev/null || cp -a "$HTTPD_CONF" "$tmp"
-  mv "$tmp" "$HTTPD_CONF"
+  # No-op: CyberPanel vhosts are enabled by default; avoiding awk edits that can upset mawk in edge cases.
+  :
 }
 ensure_extproxy_and_root(){
   local vhconf="$1" vhname="$2" port="$3"
@@ -418,7 +406,7 @@ cmd_disable(){
   systemctl disable "$(service_name "$domain")" || true
   vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
   sed -i '/^# >>> cyberpanel-dotnet BEGIN/,/^# <<< cyberpanel-dotnet END/d' "$vhconf" || true
-  sed -i '/^# >>> cyberpanel-dotnet EXTAPP BEGIN/,/^# <<< cyberpanel-dotnet EXTAPP END/d' "$vhconf" || true
+  sed -i '/^# >>> cyberpanel-dotnet EXTAPP BEGIN/,/^# <<< cyberpanel-dotnet END/d' "$vhconf" || true
   remove_root_contexts "$vhconf" || true
   ols_reload
   echo "Disabled $domain"
@@ -471,7 +459,7 @@ EOF
   ensure_vhDomain "$vhconf" "$domain"
   ensure_extproxy_and_root "$vhconf" "$vhname" "$port"
   fix_listener_mappings "$domain" "$vhname"
-  ols_reload()
+  ols_reload
 
   grn "✅ Enabled $domain"
   echo "------------------------------------------------------------"

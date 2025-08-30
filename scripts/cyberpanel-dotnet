@@ -18,6 +18,7 @@ ENV_DIR="/etc/dotnet-apps"
 STATE_DIR="/etc/cyberpanel-dotnet"
 PORT_RANGE_START=${PORT_RANGE_START:-5100}
 PORT_RANGE_END=${PORT_RANGE_END:-8999}
+
 MARK_BEGIN="# >>> cyberpanel-dotnet BEGIN"
 MARK_END="# <<< cyberpanel-dotnet END"
 MARK_EXT_BEGIN="# >>> cyberpanel-dotnet EXTAPP BEGIN"
@@ -60,7 +61,6 @@ ols_reload(){
   if [[ -x "$LSWS_ROOT/bin/lswsctrl" ]]; then "$LSWS_ROOT/bin/lswsctrl" reload || true; fi
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
 }
-
 trim_slash(){ local p="${1:-}"; p="${p%/}"; echo "$p"; }
 
 # ---------- vhost helpers ----------
@@ -92,12 +92,14 @@ docroot_from_vhconf(){
   dr="$(_expand_vars "$raw" "$vhconf")"
   dr="$(echo "$dr" | sed -E 's@//+@/@g')"
   dr="${dr%/}"
+  # if still wrong or contains leftover $VARS, fallback to canonical path
   if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" || "$dr" =~ [$][A-Z_\{] ]]; then
     local vhname dguess
     vhname="$(basename "$(dirname "$vhconf")")"
-    dguess="$(awk '/^[ \t]*vhDomain[ \t]+/{
-      for(i=2;i<=NF;i++){gsub(/,|"/,"",$i); if($i!=""){print $i; exit}}
-    }' "$vhconf" 2>/dev/null || true)"
+    dguess="$(awk '
+      /^[[:space:]]*vhDomain[[:space:]]+/{
+        for(i=2;i<=NF;i++){ gsub(/,|"/,"",$i); if($i!=""){ print $i; exit } }
+      }' "$vhconf" 2>/dev/null || true)"
     [[ -z "$dguess" ]] && dguess="$vhname"
     dr="/home/$dguess/public_html"
   fi
@@ -106,23 +108,24 @@ docroot_from_vhconf(){
 _vhname_from_map(){
   local domain="$1"
   awk -v D="$domain" '
-    BEGIN{IGNORECASE=1; in=0}
-    /^[ \t]*listener[ \t]+/ {in=1; next}
-    in==1 && /^[ \t]*map[ \t]+/ {
-      line=tolower($0); d=tolower(D);
+    BEGIN{in=0}
+    /^[[:space:]]*listener[[:space:]]+/ { in=1; next }
+    in==1 && /^[[:space:]]*map[[:space:]]+/ {
+      line = tolower($0); d = tolower(D);
       if (index(line, d)) { print $2; exit }
+      next
     }
-    in==1 && /^[ \t]*}/ {in=0}
+    in==1 && /^[[:space:]]*}/ { in=0 }
   ' "$HTTPD_CONF" 2>/dev/null || true
 }
 _configfile_for_vh(){
   local vhname="$1"
   local raw
   raw="$(awk -v N="$vhname" '
-    BEGIN{IGNORECASE=1; in=0}
-    /^[ \t]*virtualHost[ \t]+/ { in = ($2==N); next }
-    in==1 && /^[ \t]*configFile[ \t]+/ { print $2; exit }
-    in==1 && /^[ \t]*}/ { in=0 }
+    BEGIN{in=0}
+    /^[[:space:]]*virtualHost[[:space:]]+/ { in = ($2==N); next }
+    in==1 && /^[[:space:]]*configFile[[:space:]]+/ { print $2; exit }
+    in==1 && /^[[:space:]]*}/ { in=0 }
   ' "$HTTPD_CONF" 2>/dev/null || true)"
   [[ -z "$raw" ]] && return 1
   local exp="${raw//\$SERVER_ROOT/$LSWS_ROOT}"
@@ -133,16 +136,19 @@ _configfile_for_vh(){
 vhconf_for(){
   local domain="$1" override="${2:-}"
   [[ -n "$override" && -f "$override" ]] && { echo "$override"; return; }
+
   local vhname conf
   vhname="$(_vhname_from_map "$domain")"
   if [[ -n "$vhname" ]]; then
     conf="$(_configfile_for_vh "$vhname" || true)"
     [[ -n "$conf" && -f "$conf" ]] && { echo "$conf"; return; }
-    [[ -f "$VHOSTS_DIR/$vhname/vhost.conf" ]] && { echo "$VHOSTS_DIR/$vhname/vhost.conf"; return; }
-    [[ -f "$VHOSTS_DIR/$vhname/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$vhname/vhconf.conf"; return; }
+    [[ -f "$VHOSTS_DIR/$vhname/vhost.conf"   ]] && { echo "$VHOSTS_DIR/$vhname/vhost.conf"; return; }
+    [[ -f "$VHOSTS_DIR/$vhname/vhconf.conf"  ]] && { echo "$VHOSTS_DIR/$vhname/vhconf.conf"; return; }
   fi
-  [[ -f "$VHOSTS_DIR/$domain/vhost.conf" ]] && { echo "$VHOSTS_DIR/$domain/vhost.conf"; return; }
+
+  [[ -f "$VHOSTS_DIR/$domain/vhost.conf"  ]] && { echo "$VHOSTS_DIR/$domain/vhost.conf"; return; }
   [[ -f "$VHOSTS_DIR/$domain/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$domain/vhconf.conf"; return; }
+
   local f dr
   for f in "$VHOSTS_DIR"/*/vhost.conf "$VHOSTS_DIR"/*/vhconf.conf; do
     [[ -f "$f" ]] || continue
@@ -151,6 +157,7 @@ vhconf_for(){
       echo "$dr" | grep -qiE "/$domain(/|.*)public_html/?$" && { echo "$f"; return; }
     fi
   done
+
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR.
 Hints:
   • Ensure the site exists in CyberPanel.
@@ -159,13 +166,18 @@ Hints:
 workdir_for_domain(){
   local domain="$1" override="${2:-}" vh dr
   vh="$(vhconf_for "$domain" "$override")" || exit 1
+
+  # canonical CyberPanel path first
   if [[ -d "/home/$domain/public_html" ]]; then echo "/home/$domain/public_html"; return; fi
+
   dr="$(docroot_from_vhconf "$vh" || true)"
   if [[ -n "$dr" && -d "$dr" ]]; then echo "$dr"; return; fi
+
   local guess
   guess="$(find /home -maxdepth 3 -type d -path "/home/*/public_html" 2>/dev/null | grep "/$domain/" -m1 || true)"
   [[ -n "$guess" ]] && { echo "$guess"; return; }
-  err "Could not find document root for '$domain'."
+
+  err "Could not find document root for '$domain'. Ensure the website exists in CyberPanel."
 }
 
 # ---------- .NET + ports ----------
@@ -196,6 +208,7 @@ get_port_from_service(){
   p="$(systemctl show "$(service_name "$domain")" -p Environment 2>/dev/null | sed -n 's/^Environment=.*PORT=\([0-9]\+\).*$/\1/p' | head -n1)"
   [[ -n "$p" ]] && echo "$p" || return 1
 }
+
 resolve_dll_from_marker(){
   local workdir="$1"
   if [[ -f "$workdir/.dotnet" ]]; then
@@ -282,12 +295,12 @@ ensure_vhost_enabled(){
   local vhname="$1"
   local tmp; tmp="$(mktemp)"
   awk -v N="$vhname" '
-    BEGIN{IGNORECASE=1; in=0}
-    /^[ \t]*virtualHost[ \t]+/ { in = ($2==N); print; next }
-    in==1 && /^[ \t]*enable[ \t]+0/ { sub(/enable[ \t]+0/, "enable                 1"); print; next }
-    in==1 && /^[ \t]*enable[ \t]+1/ { print; next }
-    in==1 && /^[ \t]*configFile[ \t]+/ { print; next }
-    in==1 && /^[ \t]*}/ { print; in=0; next }
+    BEGIN{in=0}
+    /^[[:space:]]*virtualHost[[:space:]]+/ { in = ($2==N); print; next }
+    in==1 && /^[[:space:]]*enable[[:space:]]+0/ { sub(/enable[[:space:]]+0/, "enable                 1"); print; next }
+    in==1 && /^[[:space:]]*enable[[:space:]]+1/ { print; next }
+    in==1 && /^[[:space:]]*configFile[[:space:]]+/ { print; next }
+    in==1 && /^[[:space:]]*}/ { print; in=0; next }
     { print }
   ' "$HTTPD_CONF" > "$tmp" && mv "$tmp" "$HTTPD_CONF"
 }

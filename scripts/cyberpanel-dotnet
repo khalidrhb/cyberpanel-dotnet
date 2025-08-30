@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 shopt -s extglob nullglob
 
-# ---------- UI ----------
+# ------------ UI ------------
 red(){ echo -e "\e[31m$*\e[0m"; }
 grn(){ echo -e "\e[32m$*\e[0m"; }
 yel(){ echo -e "\e[33m$*\e[0m"; }
@@ -12,7 +12,7 @@ err(){ red "[ERROR] $*" 1>&2; exit 1; }
 info(){ echo "[i] $*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1"; }
 
-# ---------- Globals ----------
+# ------------ Globals ------------
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/dotnet-apps"
 STATE_DIR="/etc/cyberpanel-dotnet"
@@ -27,13 +27,12 @@ MARK_EXT_END="# <<< cyberpanel-dotnet EXTAPP END"
 
 mkdir -p "$STATE_DIR" "$ENV_DIR"
 
-# ---------- Helpers ----------
 sanitize_id(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'; }
 service_name(){ local id; id=$(sanitize_id "$1"); echo "dotnet-app@${id}.service"; }
 service_path(){ echo "$SYSTEMD_DIR/$(service_name "$1")"; }
 envfile_path(){ local id; id=$(sanitize_id "$1"); echo "$ENV_DIR/${id}.env"; }
 
-# ---------- OpenLiteSpeed discovery ----------
+# ------------ OLS discovery ------------
 _detect_lsws_root(){
   if [[ -n "${LSWS_ROOT:-}" && -x "${LSWS_ROOT}/bin/lswsctrl" ]]; then echo "$LSWS_ROOT"; return; fi
   [[ -x "/usr/local/lsws/bin/lswsctrl" ]] && { echo "/usr/local/lsws"; return; }
@@ -56,74 +55,39 @@ ols_reload(){
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
 }
 
-# ---------- vhost + docroot resolution ----------
-_expand_vars(){
-  local raw="${1:-}" vhconf="${2:-}"
-  local vhname serverroot="$LSWS_ROOT" vhroot=""
-  vhname="$(basename "$(dirname "$vhconf")")"
-  vhroot="$(awk '/^[ \t]*vhRoot[ \t]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
-  vhroot="${vhroot%\"}"; vhroot="${vhroot#\"}"
-  if [[ -n "$vhroot" ]]; then
-    vhroot="${vhroot//\$SERVER_ROOT/$serverroot}"
-    vhroot="${vhroot//\$\{SERVER_ROOT\}/$serverroot}"
-    vhroot="${vhroot//\$VH_NAME/$vhname}"
-    vhroot="${vhroot//\$\{VH_NAME\}/$vhname}"
-  fi
-  raw="${raw//\$VH_ROOT/$vhroot}"
-  raw="${raw//\$\{VH_ROOT\}/$vhroot}"
-  raw="${raw//\$SERVER_ROOT/$serverroot}"
-  raw="${raw//\$\{SERVER_ROOT\}/$serverroot}"
-  raw="${raw//\$VH_NAME/$vhname}"
-  raw="${raw//\$\{VH_NAME\}/$vhname}"
-  echo "$raw"
-}
-
-docroot_from_vhconf(){
-  local vhconf="$1"
-  local raw dr
-  raw="$(awk '/^[ \t]*docRoot[ \t]+/{print $2; exit}' "$vhconf" 2>/dev/null || true)"
-  raw="${raw%\"}"; raw="${raw#\"}"
-  dr="$(_expand_vars "$raw" "$vhconf")"
-  dr="$(echo "$dr" | sed -E 's@//+@/@g')"; dr="${dr%/}"
-  if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" || "$dr" =~ [$][A-Z_\{] ]]; then
-    local vhname dguess
-    vhname="$(basename "$(dirname "$vhconf")")"
-    dguess="$(awk '
-      /^[ \t]*vhDomain[ \t]+/{
-        for(i=2;i<=NF;i++){ gsub(/,|"/,"",$i); if($i!=""){ print $i; exit } }
-      }' "$vhconf" 2>/dev/null || true)"
-    [[ -z "$dguess" || "$dguess" =~ ^[$] ]] && dguess="$vhname"
-    dr="/home/$dguess/public_html"
-  fi
-  echo "$dr"
-}
-
+# ------------ VirtualHost + DocRoot resolution (Perl only) ------------
 virt_name_for_domain(){
-  # virtualHost name used by httpd_config.conf map lines for this domain
   local domain="$1"
-  grep -inE '^[[:space:]]*map[[:space:]]+' "$HTTPD_CONF" \
-    | grep -iE "(^|[[:space:]])$domain([[:space:]]|$)" \
-    | awk '{print $2; exit}' 2>/dev/null || true
+  # Print the *first* mapping vhost name for the domain
+  perl -ne '
+    BEGIN { $d = lc($ENV{D}); }
+    if ( /^\s*map\s+(\S+)\s+(.*)$/i ) {
+      my ($vh,$rest)=($1,$2); $_=lc($rest);
+      if ( /\b\Q$d\E\b/ ) { print "$vh\n"; exit 0 }
+    }
+  ' D="$domain" "$HTTPD_CONF" || true
 }
 
 configfile_for_vh_name(){
   local vhname="$1"
-  [[ -z "$vhname" ]] && { echo ""; return 1; }
-  local raw
-  raw="$(sed -n "/^[[:space:]]*virtualHost[[:space:]]\+$vhname[[:space:]]*{/,/^[[:space:]]*}/p" "$HTTPD_CONF" \
-        | sed -n 's/^[[:space:]]*configFile[[:space:]]\+\(.*\)$/\1/p' | head -n1)"
-  raw="${raw%\"}"; raw="${raw#\"}"
-  [[ -z "$raw" ]] && { echo ""; return 1; }
-  local exp="${raw//\$SERVER_ROOT/$LSWS_ROOT}"
-  exp="${exp//\$\{SERVER_ROOT\}/$LSWS_ROOT}"
-  exp="${exp//\$VH_NAME/$vhname}"
-  exp="${exp//\$\{VH_NAME\}/$vhname}"
-  [[ "${exp:0:1}" != "/" ]] && exp="$LSWS_ROOT/$exp"
-  echo "$exp"
+  perl -0777 -ne '
+    BEGIN{ $vh = $ENV{VH}; $found=0 }
+    if ( s/^\s*virtualHost\s+\Q$vh\E\s*\{(.*?)^\s*\}//ms ) {
+      my $body=$1;
+      if ($body =~ /^\s*configFile\s+(.*)$/m){
+        my $cf=$1; $cf =~ s/^"|"$//g;
+        $cf =~ s/\$SERVER_ROOT/'"$LSWS_ROOT"'/g;
+        $cf =~ s/\$\{SERVER_ROOT\}/'"$LSWS_ROOT"'/g;
+        $cf =~ s/\$VH_NAME/$vh/g;
+        $cf =~ s/\$\{VH_NAME\}/$vh/g;
+        if ($cf !~ m{^/}) { $cf = "'"$LSWS_ROOT"'/$cf" }
+        print "$cf\n"; exit 0;
+      }
+    }
+  ' VH="$vhname" "$HTTPD_CONF" || true
 }
 
 vhconf_for(){
-  # Return the vhost conf file used for this domain.
   local domain="$1" override="${2:-}"
   [[ -n "$override" && -f "$override" ]] && { echo "$override"; return; }
 
@@ -135,26 +99,59 @@ vhconf_for(){
     [[ -f "$VHOSTS_DIR/$vhname/vhost.conf"  ]] && { echo "$VHOSTS_DIR/$vhname/vhost.conf"; return; }
     [[ -f "$VHOSTS_DIR/$vhname/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$vhname/vhconf.conf"; return; }
   fi
-
   [[ -f "$VHOSTS_DIR/$domain/vhost.conf"  ]] && { echo "$VHOSTS_DIR/$domain/vhost.conf"; return; }
   [[ -f "$VHOSTS_DIR/$domain/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$domain/vhconf.conf"; return; }
 
-  local f dr
+  # Heuristic scan
+  local f
   for f in "$VHOSTS_DIR"/*/vhost.conf "$VHOSTS_DIR"/*/vhconf.conf; do
     [[ -f "$f" ]] || continue
-    if awk -v D="$domain" '
-         /^[ \t]*vhDomain[ \t]+/ { line=$0; gsub(/[A-Z]/,"",line); d=D; gsub(/[A-Z]/,"",d); if (index(line,d)>0){ print "hit"; exit } }
-       ' "$f" | grep -q hit; then
-      echo "$f"; return
-    fi
-    dr="$(docroot_from_vhconf "$f" || true)"
-    [[ -n "$dr" ]] && echo "$dr" | grep -qiE "/$domain(/|.*)public_html/?$" && { echo "$f"; return; }
+    perl -ne '
+      BEGIN{ $d=lc($ENV{D}); $hit=0 }
+      if (/^\s*vhDomain\s+(.*)$/i) {
+        $_=lc($1); s/,/ /g;
+        if (/\b\Q$d\E\b/) { $hit=1; print "hit\n"; exit 0 }
+      }
+    ' D="$domain" "$f" | grep -q '^hit$' && { echo "$f"; return; }
   done
 
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR.
 Hints:
-  • Ensure the site exists in CyberPanel.
+  • Create the site in CyberPanel first.
   • Or pass:  --vhconf /usr/local/lsws/conf/vhosts/<name>/(vhost|vhconf).conf"
+}
+
+docroot_from_vhconf(){
+  local vhconf="$1"
+  perl -ne '
+    BEGIN{ $vhconf=$ENV{VH}; }
+    if (/^\s*docRoot\s+(.*)$/){ $dr=$1; $dr =~ s/^"|"$//g; print "$dr\n"; exit 0 }
+  ' VH="$vhconf" "$vhconf" | {
+    read -r raw || true
+    raw="${raw:-}"
+    # expand variables
+    local vhname vhroot
+    vhname="$(basename "$(dirname "$vhconf")")"
+    vhroot="$(perl -ne "if(/^\\s*vhRoot\\s+(.*)\$/){\$x=\$1; \$x=~s/^\\\"|\\\"\\\$//g; print \$x; exit}" "$vhconf" 2>/dev/null || true)"
+    raw="${raw//\$SERVER_ROOT/$LSWS_ROOT}"
+    raw="${raw//\$\{SERVER_ROOT\}/$LSWS_ROOT}"
+    raw="${raw//\$VH_NAME/$vhname}"
+    raw="${raw//\$\{VH_NAME\}/$vhname}"
+    if [[ -n "$vhroot" ]]; then
+      vhroot="${vhroot//\$SERVER_ROOT/$LSWS_ROOT}"
+      vhroot="${vhroot//\$\{SERVER_ROOT\}/$LSWS_ROOT}"
+      vhroot="${vhroot//\$VH_NAME/$vhname}"
+      vhroot="${vhroot//\$\{VH_NAME\}/$vhname}"
+      raw="${raw//\$VH_ROOT/$vhroot}"
+      raw="${raw//\$\{VH_ROOT\}/$vhroot}"
+    fi
+    raw="$(echo "$raw" | sed -E 's@//+@/@g')"
+    raw="${raw%/}"
+    if [[ -z "$raw" || "$raw" == "/public_html" || "$raw" == "public_html" || "$raw" =~ [$][A-Z_\{] ]]; then
+      raw="/home/$vhname/public_html"
+    fi
+    echo "$raw"
+  }
 }
 
 workdir_for_domain(){
@@ -169,9 +166,7 @@ workdir_for_domain(){
   err "Could not find document root for '$domain'. Ensure the website exists in CyberPanel."
 }
 
-# ---------- .NET / ports ----------
-find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
-
+# ------------ .NET / ports ------------
 port_in_use(){
   local p="$1"
   ss -ltnH 2>/dev/null | awk -v P="$p" '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$P" \
@@ -206,57 +201,48 @@ resolve_dll(){
   err "DLL '$dll' not found under '$dir'. Upload your published files."
 }
 
-# ---------- OLS editing ----------
-remove_root_contexts(){
-  local vhconf="$1"
-  awk '
-    BEGIN{depth=0; inroot=0}
-    /^[ \t]*context[ \t]*\/[ \t]*\{/ { inroot=1; depth=1; next }
-    inroot==1 {
-      for(i=1;i<=length($0);i++){
-        c=substr($0,i,1)
-        if(c=="{")depth++
-        else if(c=="}"){ depth--; if(depth==0){ inroot=0; next } }
+# ------------ OLS editing (Perl, block-safe) ------------
+ensure_virtualhost_enable(){
+  local vhname="$1"
+  local bkp="$HTTPD_CONF.bak.$(date +%s)"
+  cp -a "$HTTPD_CONF" "$bkp"
+  perl -0777 -i -pe '
+    BEGIN { $vh = $ENV{VH}; $did=0 }
+    s{
+      (^ \s* virtualHost \s+ \Q$vh\E \s* \{)  (.*?)  (^ \s* \})
+    }{
+      my ($head,$body,$tail)=($1,$2,$3);
+      if ($body !~ /^\s*enable\s+1\s*$/m) {
+        if ($body =~ s/^\s*enable\s+\d+\s*$/  enable                 1/m) {
+          # replaced existing enable
+        } elsif ($body =~ s/^\s*configFile\b/  enable                 1\n$&/m) {
+          # inserted before configFile
+        } else {
+          $body = "  enable                 1\n$body";
+        }
+        $did=1;
       }
-      next
-    }
-    { print }
-  ' "$vhconf" > "$vhconf.__no_root__" && mv "$vhconf.__no_root__" "$vhconf"
+      "$head$body$tail"
+    }gmsx;
+    END{ }
+  ' VH="$vhname" "$HTTPD_CONF"
 }
 
-ensure_virtualhost_enable(){
-  # Make sure virtualHost <name> has "enable 1" in httpd_config.conf
-  local vhname="$1" tmp="$HTTPD_CONF.__vh__"
-  cp -a "$HTTPD_CONF" "$HTTPD_CONF.bak.$(date +%s)"
-  awk -v N="$vhname" '
-    BEGIN{in=0; done=0}
-    /^[ \t]*virtualHost[ \t]+/ {
-      if ($2==N) { in=1; print; next }
-    }
-    in==1 && /^[ \t]*enable[ \t]+0/ { sub(/enable[ \t]+0/,"enable                 1"); print; done=1; next }
-    in==1 && /^[ \t]*enable[ \t]+1/ { print; done=1; next }
-    in==1 && /^[ \t]*configFile[ \t]+/ {
-      if(done==0){ print "  enable                 1"; done=1 }
-      print; next
-    }
-    in==1 && /^[ \t]*}/ {
-      if(done==0) print "  enable                 1"
-      print; in=0; next
-    }
-    { print }
-  ' "$HTTPD_CONF" > "$tmp" && mv "$tmp" "$HTTPD_CONF"
+remove_root_contexts(){
+  local vhconf="$1"
+  perl -0777 -i -pe '
+    # remove any root context blocks
+    s/^\s*context\s*\/\s*\{(?:[^{}]|\{[^{}]*\})*^\s*\}\s*\n?//gms;
+    # and our previous markers if any
+    s/^# >>> cyberpanel-dotnet BEGIN.*?# <<< cyberpanel-dotnet END\s*\n?//gms;
+    s/^# >>> cyberpanel-dotnet EXTAPP BEGIN.*?# <<< cyberpanel-dotnet END\s*\n?//gms;
+  ' "$vhconf"
 }
 
 ensure_extapp_and_proxy(){
-  # Safer: extprocessor + proxyExtAppName context
   local vhconf="$1" vhname="$2" port="$3"
-  local id; id="$(sanitize_id "$vhname")"
-
-  # clean out previous blocks and any existing root contexts
-  sed -i "/^$MARK_EXT_BEGIN/,/^$MARK_EXT_END/d" "$vhconf" || true
-  sed -i "/^$MARK_BEGIN/,/^$MARK_END/d" "$vhconf" || true
   remove_root_contexts "$vhconf"
-
+  local id; id="$(sanitize_id "$vhname")"
   cat >>"$vhconf" <<EOF
 $MARK_EXT_BEGIN
 extprocessor cpdotnet-$id {
@@ -286,54 +272,37 @@ $MARK_END
 EOF
 }
 
-ensure_vhDomain(){
-  local vhconf="$1" domain="$2"
-  if grep -qiE '^[[:space:]]*vhDomain[[:space:]]+' "$vhconf"; then
-    local cur rest merged
-    cur="$(grep -iE '^[[:space:]]*vhDomain[[:space:]]+' "$vhconf" | head -n1)"
-    rest="${cur#*vhDomain}"; rest="$(echo "$rest" | tr -d '\r' | tr ',' ' ' | tr '[:upper:]' '[:lower:]')"
-    merged="$(printf '%s\n%s\nwww.%s\n' "$rest" "$domain" "$domain" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd',' -)"
-    awk -v NEW="vhDomain $merged" '
-      BEGIN{done=0}
-      { if (!done && $0 ~ /^[[:space:]]*vhDomain[[:space:]]+/) { print NEW; done=1 } else print $0 }
-    ' "$vhconf" > "$vhconf.__vhd__" && mv "$vhconf.__vhd__" "$vhconf"
-  else
-    printf '\n# added by cyberpanel-dotnet\nvhDomain %s, %s\n' "$domain" "www.$domain" >> "$vhconf"
-  fi
-}
-
 fix_listener_mappings(){
-  # Put our mapping first and drop duplicates for this domain.
-  local domain="$1" vhname="$2" httpd="$HTTPD_CONF"
-  [[ -f "$httpd" ]] || err "httpd_config.conf not found"
-  cp -a "$httpd" "$httpd.bak.$(date +%s)"
-  awk -v VH="$vhname" -v D1="$domain" -v D2="www.$domain" '
-    BEGIN { inblk=0; m=0 }
-    {
-      line=$0
-      if (line ~ /^[ \t]*listener[ \t]+/) { inblk=1; m=0; print line; next }
-      if (inblk==1 && line ~ /^[ \t]*address[ \t]+/) { print line; next }
-      if (inblk==1 && line ~ /^[ \t]*secure[ \t]+/)  { print line; next }
-      if (inblk==1 && line ~ /^[ \t]*map[ \t]+/) { maps[++m]=line; next }
-      if (inblk==1 && line ~ /^[ \t]*}/) {
-        print "  map  " VH "  " D1 " " D2
-        for (i=1; i<=m; i++) {
-          low=maps[i]; gsub(/[A-Z]/,"",low)
-          d1=D1; d2=D2; gsub(/[A-Z]/,"",d1); gsub(/[A-Z]/,"",d2)
-          if (index(low,d1)>0 || index(low,d2)>0) continue
-          print maps[i]
+  local domain="$1" vhname="$2"
+  local bkp="$HTTPD_CONF.bak.$(date +%s)"
+  cp -a "$HTTPD_CONF" "$bkp"
+  perl -0777 -i -pe '
+    BEGIN{ $vh=$ENV{VH}; $d=$ENV{D}; $dw="www.$ENV{D}"; }
+    # Inside each listener block, rebuild map list with our map first and drop dups for the domain.
+    s{
+      (^ \s* listener \b [^{]* \{) (.*?) (^ \s* \})
+    }{
+      my ($head,$body,$tail)=($1,$2,$3);
+      my @out = ("  map  $vh  $d $dw\n");
+      my @keep;
+      for my $line (split /\n/, $body){
+        if ($line =~ /^\s*map\b/i){
+          my $lc = lc($line);
+          next if $lc =~ /\b\Q$d\E\b/;      # drop any existing for domain
+          next if $lc =~ /\b\Q$dw\E\b/;
+          push @keep, "$line\n";
+        } else {
+          push @keep, "$line\n" unless $line =~ /^\s*$/;
         }
-        inblk=0; m=0; print line; next
       }
-      print line
-    }
-  ' "$httpd" > "$httpd.__new__" && mv "$httpd.__new__" "$httpd"
-  ols_reload
+      $head . (join("", @out, @keep)) . $tail
+    }gmsx;
+  ' VH="$vhname" D="$domain" "$HTTPD_CONF"
 }
 
-# ---------- Commands ----------
+# ------------ Commands ------------
 cmd_check(){
-  need awk; need sed; need grep; ols_paths
+  need perl; need sed; need grep; ols_paths
   local domain="$1" vhconf docroot p
   vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
   docroot="$(docroot_from_vhconf "$vhconf" || true)"; [[ -z "$docroot" ]] && docroot="/home/$domain/public_html"
@@ -377,15 +346,14 @@ cmd_disable(){
   systemctl stop "$(service_name "$domain")" || true
   systemctl disable "$(service_name "$domain")" || true
   vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
-  sed -i "/^$MARK_BEGIN/,/^$MARK_END/d" "$vhconf" || true
-  sed -i "/^$MARK_EXT_BEGIN/,/^$MARK_EXT_END/d" "$vhconf" || true
   remove_root_contexts "$vhconf" || true
   ols_reload
   echo "Disabled $domain"
 }
 
 cmd_enable(){
-  need awk; need sed; need grep; ols_paths
+  need perl; need sed; need grep; ols_paths
+
   local domain="" dll="" port="" override_vh=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -423,26 +391,24 @@ EOF
   systemctl enable "$unit" >/dev/null 2>&1 || true
   systemctl restart "$unit"
 
-  # Resolve mapped virtualHost name + conf from httpd_config.conf
+  # Get mapped virtualHost and its config file
   vhname_map="$(virt_name_for_domain "$domain" || true)"
+  [[ -z "$vhname_map" ]] && vhname_map="$(basename "$(dirname "$vhconf")")"
   conf_map="$(configfile_for_vh_name "$vhname_map" || true)"
 
-  # Ensure vhost enabled (defensive)
-  [[ -n "$vhname_map" ]] && ensure_virtualhost_enable "$vhname_map"
+  # Ensure the mapped virtualHost is enabled
+  ensure_virtualhost_enable "$vhname_map"
 
-  # Inject into resolved vhconf
-  ensure_vhDomain "$vhconf" "$domain"
-  ensure_extapp_and_proxy "$vhconf" "${vhname_map:-$(basename "$(dirname "$vhconf")")}" "$port"
+  # Inject proxy/extapp into the resolved file (always)
+  ensure_extapp_and_proxy "$vhconf" "$vhname_map" "$port"
 
-  # If httpd_config.conf maps to a different file, inject there too.
+  # If httpd_config maps to a different file, inject there too
   if [[ -n "$conf_map" && -f "$conf_map" && "$conf_map" != "$vhconf" ]]; then
-    ensure_vhDomain "$conf_map" "$domain"
     ensure_extapp_and_proxy "$conf_map" "$vhname_map" "$port"
     also="$conf_map"
   fi
 
-  # Fix listener maps to our virtualHost name
-  [[ -z "$vhname_map" ]] && vhname_map="$(basename "$(dirname "$vhconf")")"
+  # Fix listener maps to point to this virtualHost, dedupe
   fix_listener_mappings "$domain" "$vhname_map"
   ols_reload
 
@@ -464,7 +430,7 @@ EOF
 }
 
 cmd_fixmap(){
-  ols_paths
+  need perl; ols_paths
   local domain="$1" vhconf vhname
   vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
   vhname="$(virt_name_for_domain "$domain" || true)"
@@ -473,7 +439,6 @@ cmd_fixmap(){
   fix_listener_mappings "$domain" "$vhname"
 }
 
-# ---------- CLI ----------
 usage(){
   cat <<EOF
 cyberpanel-dotnet — make ASP.NET Core deploy like PHP on CyberPanel
@@ -488,6 +453,7 @@ Usage:
   cyberpanel-dotnet fixmap <domain>
 EOF
 }
+
 main(){
   [[ $# -ge 1 ]] || { usage; exit 1; }
   local cmd="$1"; shift || true

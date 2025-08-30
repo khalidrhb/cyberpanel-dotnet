@@ -295,17 +295,23 @@ fix_listener_mappings(){
         if (line ~ /^[ \t]*address[ \t]+/) { tmp=line; gsub(/^[ \t]*address[ \t]+/, "", tmp); split(tmp,a,/[ \t]/); addr=a[1]; print $0; next }
         if (line ~ /^[ \t]*secure[ \t]+/)  { tmp=line; gsub(/^[ \t]*secure[ \t]+/,  "", tmp); split(tmp,a,/[ \t]/); sec=a[1];  print $0; next }
         if (line ~ /^[ \t]*map[ \t]+/) {
-          if (index(line, D1)>0 || index(line, D2)>0) { hasmap=1; /* drop old dup */ next }
-          print $0; next
+          if (index(line, D1)>0 || index(line, D2)>0) {
+            hasmap=1    # drop old dup by skipping this line
+            next
+          }
+          print $0
+          next
         }
         if (line ~ /^[ \t]*}/) {
           need=0
-          # need mapping for :80 or any https (secure 1 or addr :443)
           if (addr ~ /:80/  || addr ~ /\*:80/  || addr ~ /0\.0\.0\.0:80/  || addr ~ /\[::\]:80/)  need=1
           if (sec=="1"     || addr ~ /:443/   || addr ~ /\*:443/         || addr ~ /0\.0\.0\.0:443/ || addr ~ /\[::\]:443/) need=1
-          if (need==1) { print "  map  " VH "  " D1 " " D2 }
+          if (need==1) {
+            print "  map  " VH "  " D1 " " D2
+          }
           blk=0; addr=""; sec="0"; hasmap=0
-          print $0; next
+          print $0
+          next
         }
       }
       print $0
@@ -319,8 +325,8 @@ fix_listener_mappings(){
   awk -v D1="$d1" -v D2="$d2" '
     BEGIN{L="";A="";S="0"}
     /^[ \t]*listener[ \t]+/ {L=$2; A=""; S="0"}
-    /^[ \t]*address[ \t]+/  {line=$0; gsub(/^[ \t]*address[ \t]+/, "", line); split(line,a,/[ \t]/); A=a[1]}
-    /^[ \t]*secure[ \t]+/   {line=$0; gsub(/^[ \t]*secure[ \t]+/, "", line); split(line,a,/[ \t]/); S=a[1]}
+    /^[ \t]*address[ \t]+/  {line=$0; sub(/^[ \t]*address[ \t]+/, "", line); split(line,a,/[ \t]/); A=a[1]}
+    /^[ \t]*secure[ \t]+/   {line=$0; sub(/^[ \t]*secure[ \t]+/,  "", line); split(line,a,/[ \t]/); S=a[1]}
     /^[ \t]*map[ \t]+/ {
       if (index($0,D1)>0 || index($0,D2)>0) {
         printf("listener=%s  address=%s  secure=%s  %s\n", L, A, S, $0)

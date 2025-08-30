@@ -289,10 +289,8 @@ ensure_vhDomain(){
     printf '\n# added by cyberpanel-dotnet\nvhDomain %s, %s\n' "$domain" "www.$domain" >> "$vhconf"
   fi
 }
-ensure_vhost_enabled(){
-  # No-op: CyberPanel vhosts are enabled by default; avoiding awk edits that can upset mawk in edge cases.
-  :
-}
+ensure_vhost_enabled(){ :; }  # no-op; CyberPanel vhosts are enabled by default
+
 ensure_extproxy_and_root(){
   local vhconf="$1" vhname="$2" port="$3"
   local ep="cpdotnet-$(echo "$vhname" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g')"
@@ -329,30 +327,36 @@ context / {
 $MARK_END
 EOF
 }
+
 fix_listener_mappings(){
   local domain="$1" vhname="$2"
   local httpd="$HTTPD_CONF"
   [[ -f "$httpd" ]] || err "httpd_config.conf not found"
   cp -a "$httpd" "$httpd.bak.$(date +%s)"
+
   awk -v VH="$vhname" -v D1="$domain" -v D2="www.$domain" '
-    BEGIN { blk=0 }
+    BEGIN { inblk=0; m=0 }
     {
       line=$0
-      if (line ~ /^[ \t]*listener[ \t]+/) { blk=1; print line; next }
-      if (blk==1 && line ~ /^[ \t]*address[ \t]+/) { print line; next }
-      if (blk==1 && line ~ /^[ \t]*secure[ \t]+/)  { print line; next }
-      if (blk==1 && line ~ /^[ \t]*map[ \t]+/) {
-        low = tolower(line)
-        if (index(low, tolower(D1))>0 || index(low, tolower(D2))>0) { next }
-        print line; next
-      }
-      if (blk==1 && line ~ /^[ \t]*}/) {
+      if (line ~ /^[ \t]*listener[ \t]+/) { inblk=1; m=0; print line; next }
+      if (inblk==1 && line ~ /^[ \t]*address[ \t]+/) { print line; next }
+      if (inblk==1 && line ~ /^[ \t]*secure[ \t]+/)  { print line; next }
+      if (inblk==1 && line ~ /^[ \t]*map[ \t]+/) { maps[++m]=line; next }
+      if (inblk==1 && line ~ /^[ \t]*}/) {
+        # put our map first
         print "  map  " VH "  " D1 " " D2
-        blk=0; print line; next
+        # then any existing map not targeting this domain
+        for (i=1; i<=m; i++) {
+          low = tolower(maps[i])
+          if (index(low, tolower(D1))>0 || index(low, tolower(D2))>0) continue
+          print maps[i]
+        }
+        inblk=0; m=0; print line; next
       }
       print line
     }
   ' "$httpd" > "$httpd.__new__"
+
   mv "$httpd.__new__" "$httpd"
   ols_reload
 }

@@ -32,9 +32,7 @@ VHOSTS_DIR=""
 mkdir -p "$STATE_DIR" "$ENV_DIR"
 
 # ---------- ID helpers ----------
-sanitize_id(){
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'
-}
+sanitize_id(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'; }
 service_name(){ local id; id=$(sanitize_id "$1"); echo "dotnet-app@${id}.service"; }
 service_path(){ echo "$SYSTEMD_DIR/$(service_name "$1")"; }
 envfile_path(){ local id; id=$(sanitize_id "$1"); echo "$ENV_DIR/${id}.env"; }
@@ -92,15 +90,16 @@ docroot_from_vhconf(){
   dr="$(_expand_vars "$raw" "$vhconf")"
   dr="$(echo "$dr" | sed -E 's@//+@/@g')"
   dr="${dr%/}"
-  # if still wrong or contains leftover $VARS, fallback to canonical path
+  # if missing/variabley, fallback to canonical
   if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" || "$dr" =~ [$][A-Z_\{] ]]; then
     local vhname dguess
     vhname="$(basename "$(dirname "$vhconf")")"
     dguess="$(awk '
-      /^[[:space:]]*vhDomain[[:space:]]+/{
+      /^[ \t]*vhDomain[ \t]+/{
         for(i=2;i<=NF;i++){ gsub(/,|"/,"",$i); if($i!=""){ print $i; exit } }
       }' "$vhconf" 2>/dev/null || true)"
-    [[ -z "$dguess" ]] && dguess="$vhname"
+    # If CyberPanel template left $VH_NAME here, use actual vhost dir name
+    [[ -z "$dguess" || "$dguess" =~ ^[$] ]] && dguess="$vhname"
     dr="/home/$dguess/public_html"
   fi
   echo "$dr"
@@ -109,13 +108,13 @@ _vhname_from_map(){
   local domain="$1"
   awk -v D="$domain" '
     BEGIN{in=0}
-    /^[[:space:]]*listener[[:space:]]+/ { in=1; next }
-    in==1 && /^[[:space:]]*map[[:space:]]+/ {
+    /^[ \t]*listener[ \t]+/ { in=1; next }
+    in==1 && /^[ \t]*map[ \t]+/ {
       line = tolower($0); d = tolower(D);
       if (index(line, d)) { print $2; exit }
       next
     }
-    in==1 && /^[[:space:]]*}/ { in=0 }
+    in==1 && /^[ \t]*}/ { in=0 }
   ' "$HTTPD_CONF" 2>/dev/null || true
 }
 _configfile_for_vh(){
@@ -123,9 +122,9 @@ _configfile_for_vh(){
   local raw
   raw="$(awk -v N="$vhname" '
     BEGIN{in=0}
-    /^[[:space:]]*virtualHost[[:space:]]+/ { in = ($2==N); next }
-    in==1 && /^[[:space:]]*configFile[[:space:]]+/ { print $2; exit }
-    in==1 && /^[[:space:]]*}/ { in=0 }
+    /^[ \t]*virtualHost[ \t]+/ { in = ($2==N); next }
+    in==1 && /^[ \t]*configFile[ \t]+/ { print $2; exit }
+    in==1 && /^[ \t]*}/ { in=0 }
   ' "$HTTPD_CONF" 2>/dev/null || true)"
   [[ -z "$raw" ]] && return 1
   local exp="${raw//\$SERVER_ROOT/$LSWS_ROOT}"
@@ -292,17 +291,19 @@ ensure_vhDomain(){
   fi
 }
 ensure_vhost_enabled(){
+  # Use sed to flip "enable 0" to "enable 1" only inside the target virtualHost block.
   local vhname="$1"
   local tmp; tmp="$(mktemp)"
   awk -v N="$vhname" '
     BEGIN{in=0}
-    /^[[:space:]]*virtualHost[[:space:]]+/ { in = ($2==N); print; next }
-    in==1 && /^[[:space:]]*enable[[:space:]]+0/ { sub(/enable[[:space:]]+0/, "enable                 1"); print; next }
-    in==1 && /^[[:space:]]*enable[[:space:]]+1/ { print; next }
-    in==1 && /^[[:space:]]*configFile[[:space:]]+/ { print; next }
-    in==1 && /^[[:space:]]*}/ { print; in=0; next }
+    /^[ \t]*virtualHost[ \t]+/ { in = ($2==N); print; next }
+    in==1 && /^[ \t]*enable[ \t]+0/ { sub(/enable[ \t]+0/, "enable                 1"); print; next }
+    in==1 && /^[ \t]*enable[ \t]+1/ { print; next }
+    in==1 && /^[ \t]*configFile[ \t]+/ { print; next }
+    in==1 && /^[ \t]*}/ { print; in=0; next }
     { print }
-  ' "$HTTPD_CONF" > "$tmp" && mv "$tmp" "$HTTPD_CONF"
+  ' "$HTTPD_CONF" > "$tmp" 2>/dev/null || cp -a "$HTTPD_CONF" "$tmp"
+  mv "$tmp" "$HTTPD_CONF"
 }
 ensure_extproxy_and_root(){
   local vhconf="$1" vhname="$2" port="$3"
@@ -470,7 +471,7 @@ EOF
   ensure_vhDomain "$vhconf" "$domain"
   ensure_extproxy_and_root "$vhconf" "$vhname" "$port"
   fix_listener_mappings "$domain" "$vhname"
-  ols_reload
+  ols_reload()
 
   grn "✅ Enabled $domain"
   echo "------------------------------------------------------------"

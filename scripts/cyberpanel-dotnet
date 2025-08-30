@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# cyberpanel-dotnet — make ASP.NET Core deploy like PHP on CyberPanel
-# Works with OpenLiteSpeed by injecting an external proxy + root proxy context
-# Author: Mohd Khalid (MIT)
-
+# cyberpanel-dotnet — make ASP.NET Core deploy like PHP on CyberPanel (OpenLiteSpeed)
+# Author: Mohd Khalid — MIT
 set -Eeuo pipefail
 shopt -s extglob nullglob
 
-# ===================== UI helpers =====================
+# ---------- UI helpers ----------
 red(){ echo -e "\e[31m$*\e[0m"; }
 grn(){ echo -e "\e[32m$*\e[0m"; }
 yel(){ echo -e "\e[33m$*\e[0m"; }
 err(){ red "[ERROR] $*" 1>&2; exit 1; }
 info(){ echo "[i] $*"; }
-need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1 (please install it)"; }
+need(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1"; }
 
-# ===================== Globals =====================
+# ---------- Globals ----------
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/dotnet-apps"
 STATE_DIR="/etc/cyberpanel-dotnet"
@@ -32,27 +30,25 @@ VHOSTS_DIR=""
 
 mkdir -p "$STATE_DIR" "$ENV_DIR"
 
-# ===================== ID helpers =====================
+# ---------- ID helpers ----------
 sanitize_id(){
-  # normalize domain to systemd-friendly id (dots -> underscores)
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g; s/[.]/_/g'
 }
 service_name(){ local id; id=$(sanitize_id "$1"); echo "dotnet-app@${id}.service"; }
 service_path(){ echo "$SYSTEMD_DIR/$(service_name "$1")"; }
 envfile_path(){ local id; id=$(sanitize_id "$1"); echo "$ENV_DIR/${id}.env"; }
 
-# ===================== OLS discovery =====================
+# ---------- OLS discovery ----------
 _detect_lsws_root(){
   if [[ -n "${LSWS_ROOT:-}" && -x "${LSWS_ROOT}/bin/lswsctrl" ]]; then echo "$LSWS_ROOT"; return; fi
   if [[ -x "/usr/local/lsws/bin/lswsctrl" ]]; then echo "/usr/local/lsws"; return; fi
   if command -v lswsctrl >/dev/null 2>&1; then
-    local p; p=$(command -v lswsctrl); p=$(readlink -f "$p" 2>/dev/null || echo "$p")
+    local p; p="$(command -v lswsctrl)"; p="$(readlink -f "$p" 2>/dev/null || echo "$p")"
     echo "${p%/bin/lswsctrl}"; return
   fi
   [[ -d "/usr/local/lsws" ]] && { echo "/usr/local/lsws"; return; }
   return 1
 }
-
 ols_paths(){
   LSWS_ROOT="$(_detect_lsws_root)" || err "OpenLiteSpeed not found"
   CONF_DIR="$LSWS_ROOT/conf"
@@ -60,17 +56,14 @@ ols_paths(){
   VHOSTS_DIR="$CONF_DIR/vhosts"
   [[ -f "$HTTPD_CONF" && -d "$VHOSTS_DIR" ]] || err "OLS conf missing under $CONF_DIR"
 }
-
 ols_reload(){
-  if [[ -x "$LSWS_ROOT/bin/lswsctrl" ]]; then
-    "$LSWS_ROOT/bin/lswsctrl" reload || true
-  fi
+  if [[ -x "$LSWS_ROOT/bin/lswsctrl" ]]; then "$LSWS_ROOT/bin/lswsctrl" reload || true; fi
   systemctl reload lsws 2>/dev/null || systemctl restart lsws 2>/dev/null || true
 }
 
 trim_slash(){ local p="${1:-}"; p="${p%/}"; echo "$p"; }
 
-# ===================== vhconf/vhost.conf helpers =====================
+# ---------- vhost helpers ----------
 _expand_vars(){
   local raw="${1:-}" vhconf="${2:-}"
   local vhname serverroot="$LSWS_ROOT" vhroot=""
@@ -91,7 +84,6 @@ _expand_vars(){
   raw="${raw//\$\{VH_NAME\}/$vhname}"
   echo "$raw"
 }
-
 docroot_from_vhconf(){
   local vhconf="$1"
   local raw dr
@@ -100,19 +92,17 @@ docroot_from_vhconf(){
   dr="$(_expand_vars "$raw" "$vhconf")"
   dr="$(echo "$dr" | sed -E 's@//+@/@g')"
   dr="${dr%/}"
-  # If expansion left variables or looks wrong, fall back to canonical CyberPanel path
   if [[ -z "$dr" || "$dr" == "/public_html" || "$dr" == "public_html" || "$dr" =~ [$][A-Z_\{] ]]; then
-    # try to pick one hostname
     local vhname dguess
     vhname="$(basename "$(dirname "$vhconf")")"
-    dguess="$(awk '/^[ \t]*vhDomain[ \t]+/{for(i=2;i<=NF;i++){gsub(/,|"/,"",$i); if($i!=""){print $i; exit}}}' "$vhconf" 2>/dev/null || true)"
+    dguess="$(awk '/^[ \t]*vhDomain[ \t]+/{
+      for(i=2;i<=NF;i++){gsub(/,|"/,"",$i); if($i!=""){print $i; exit}}
+    }' "$vhconf" 2>/dev/null || true)"
     [[ -z "$dguess" ]] && dguess="$vhname"
     dr="/home/$dguess/public_html"
   fi
   echo "$dr"
 }
-
-# Resolve vhost name from listener map lines in httpd_config.conf
 _vhname_from_map(){
   local domain="$1"
   awk -v D="$domain" '
@@ -125,8 +115,6 @@ _vhname_from_map(){
     in==1 && /^[ \t]*}/ {in=0}
   ' "$HTTPD_CONF" 2>/dev/null || true
 }
-
-# Expand configFile path for a virtualHost block
 _configfile_for_vh(){
   local vhname="$1"
   local raw
@@ -142,12 +130,9 @@ _configfile_for_vh(){
   if [[ "${exp:0:1}" != "/" ]]; then exp="$LSWS_ROOT/$exp"; fi
   echo "$exp"
 }
-
-# Return the ACTUAL vhost config file used by OLS (vhost.conf OR vhconf.conf)
 vhconf_for(){
   local domain="$1" override="${2:-}"
   [[ -n "$override" && -f "$override" ]] && { echo "$override"; return; }
-
   local vhname conf
   vhname="$(_vhname_from_map "$domain")"
   if [[ -n "$vhname" ]]; then
@@ -156,12 +141,8 @@ vhconf_for(){
     [[ -f "$VHOSTS_DIR/$vhname/vhost.conf" ]] && { echo "$VHOSTS_DIR/$vhname/vhost.conf"; return; }
     [[ -f "$VHOSTS_DIR/$vhname/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$vhname/vhconf.conf"; return; }
   fi
-
-  # try path by domain
   [[ -f "$VHOSTS_DIR/$domain/vhost.conf" ]] && { echo "$VHOSTS_DIR/$domain/vhost.conf"; return; }
   [[ -f "$VHOSTS_DIR/$domain/vhconf.conf" ]] && { echo "$VHOSTS_DIR/$domain/vhconf.conf"; return; }
-
-  # final brute force by docRoot
   local f dr
   for f in "$VHOSTS_DIR"/*/vhost.conf "$VHOSTS_DIR"/*/vhconf.conf; do
     [[ -f "$f" ]] || continue
@@ -170,46 +151,34 @@ vhconf_for(){
       echo "$dr" | grep -qiE "/$domain(/|.*)public_html/?$" && { echo "$f"; return; }
     fi
   done
-
   err "OpenLiteSpeed vhost for '$domain' not found under $VHOSTS_DIR.
 Hints:
   • Ensure the site exists in CyberPanel.
-  • Or pass an explicit file path:  --vhconf /usr/local/lsws/conf/vhosts/<name>/(vhost|vhconf).conf"
+  • Or pass:  --vhconf /usr/local/lsws/conf/vhosts/<name>/(vhost|vhconf).conf"
 }
-
-# Compute working directory for domain
 workdir_for_domain(){
   local domain="$1" override="${2:-}" vh dr
   vh="$(vhconf_for "$domain" "$override")" || exit 1
-  # canonical path first
-  if [[ -d "/home/$domain/public_html" ]]; then
-    echo "/home/$domain/public_html"; return
-  fi
+  if [[ -d "/home/$domain/public_html" ]]; then echo "/home/$domain/public_html"; return; fi
   dr="$(docroot_from_vhconf "$vh" || true)"
-  if [[ -n "$dr" && -d "$dr" ]]; then
-    echo "$dr"; return
-  fi
+  if [[ -n "$dr" && -d "$dr" ]]; then echo "$dr"; return; fi
   local guess
   guess="$(find /home -maxdepth 3 -type d -path "/home/*/public_html" 2>/dev/null | grep "/$domain/" -m1 || true)"
   [[ -n "$guess" ]] && { echo "$guess"; return; }
-  err "Could not find document root for '$domain'. Ensure the website exists and try again."
+  err "Could not find document root for '$domain'."
 }
 
-# ===================== dotnet + port helpers =====================
+# ---------- .NET + ports ----------
 find_dotnet(){ command -v dotnet >/dev/null 2>&1 && command -v dotnet || return 1; }
 port_in_use(){ ss -ltnH 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"; }
-
 alloc_port(){
-  local domain="$1"
-  local seed
+  local domain="$1" seed p
   seed=$(( ( $(echo -n "$domain" | md5sum | cut -c1-6 | tr 'a-f' '1-6') % 2000 ) + PORT_RANGE_START ))
-  local p
   for ((p=seed; p<=PORT_RANGE_END; p++)); do
     if ! port_in_use "$p"; then echo "$p"; return; fi
   done
   err "No free port in $PORT_RANGE_START..$PORT_RANGE_END"
 }
-
 get_port_from_service(){
   local domain="$1" envf svc_path p
   envf="$(envfile_path "$domain")"
@@ -227,7 +196,6 @@ get_port_from_service(){
   p="$(systemctl show "$(service_name "$domain")" -p Environment 2>/dev/null | sed -n 's/^Environment=.*PORT=\([0-9]\+\).*$/\1/p' | head -n1)"
   [[ -n "$p" ]] && echo "$p" || return 1
 }
-
 resolve_dll_from_marker(){
   local workdir="$1"
   if [[ -f "$workdir/.dotnet" ]]; then
@@ -237,11 +205,10 @@ resolve_dll_from_marker(){
   fi
   return 1
 }
-
 resolve_dll(){
   local workdir="$1"; local dll="${2:-}"
   if [[ -z "$dll" ]]; then
-    if dll="$(resolve_dll_from_marker "$workdir")"; then :; else err "--dll is required (or put DLL=YourApp.dll in $workdir/.dotnet)"; fi
+    if dll="$(resolve_dll_from_marker "$workdir")"; then :; else err "--dll is required (or set DLL=YourApp.dll in $workdir/.dotnet)"; fi
   fi
   if [[ "$dll" = /* && -f "$dll" ]]; then echo "$dll"; return; fi
   local cand
@@ -257,9 +224,7 @@ resolve_dll(){
   err "DLL '$dll' not found under '$workdir'. Upload your published files."
 }
 
-# ===================== OLS editing (robust) =====================
-
-# Remove ALL existing root "context / { ... }" blocks (brace-balanced)
+# ---------- OLS file editing ----------
 remove_root_contexts(){
   local vhconf="$1"
   awk '
@@ -277,8 +242,6 @@ remove_root_contexts(){
   ' "$vhconf" > "$vhconf.__no_root__"
   mv "$vhconf.__no_root__" "$vhconf"
 }
-
-# Drop any extprocessor with a given name (brace-balanced)
 drop_extprocessor(){
   local vhconf="$1" name="$2"
   awk -v NAME="$name" '
@@ -300,7 +263,6 @@ drop_extprocessor(){
   ' "$vhconf" > "$vhconf.__no_ext__"
   mv "$vhconf.__no_ext__" "$vhconf"
 }
-
 ensure_vhDomain(){
   local vhconf="$1" domain="$2"
   if grep -qiE '^[[:space:]]*vhDomain[[:space:]]+' "$vhconf"; then
@@ -316,11 +278,8 @@ ensure_vhDomain(){
     printf '\n# added by cyberpanel-dotnet\nvhDomain %s, %s\n' "$domain" "www.$domain" >> "$vhconf"
   fi
 }
-
 ensure_vhost_enabled(){
-  # set "enable 1" inside virtualHost block in httpd_config.conf
   local vhname="$1"
-  local in=0
   local tmp; tmp="$(mktemp)"
   awk -v N="$vhname" '
     BEGIN{IGNORECASE=1; in=0}
@@ -332,7 +291,6 @@ ensure_vhost_enabled(){
     { print }
   ' "$HTTPD_CONF" > "$tmp" && mv "$tmp" "$HTTPD_CONF"
 }
-
 ensure_extproxy_and_root(){
   local vhconf="$1" vhname="$2" port="$3"
   local ep="cpdotnet-$(echo "$vhname" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/_/g')"
@@ -340,7 +298,6 @@ ensure_extproxy_and_root(){
   remove_root_contexts "$vhconf"
   sed -i '/^# >>> cyberpanel-dotnet BEGIN/,/^# <<< cyberpanel-dotnet END/d' "$vhconf" || true
   sed -i '/^# >>> cyberpanel-dotnet EXTAPP BEGIN/,/^# <<< cyberpanel-dotnet EXTAPP END/d' "$vhconf" || true
-
   cat >>"$vhconf" <<EOF
 $MARK_EXT_BEGIN
 extprocessor $ep {
@@ -370,15 +327,11 @@ context / {
 $MARK_END
 EOF
 }
-
-# Ensure listener maps for domain in httpd_config.conf (dedup, one per listener)
 fix_listener_mappings(){
   local domain="$1" vhname="$2"
   local httpd="$HTTPD_CONF"
   [[ -f "$httpd" ]] || err "httpd_config.conf not found"
-
   cp -a "$httpd" "$httpd.bak.$(date +%s)"
-
   awk -v VH="$vhname" -v D1="$domain" -v D2="www.$domain" '
     BEGIN { blk=0 }
     {
@@ -398,54 +351,27 @@ fix_listener_mappings(){
       print line
     }
   ' "$httpd" > "$httpd.__new__"
-
   mv "$httpd.__new__" "$httpd"
   ols_reload
-
-  echo "--- Listener mappings for $domain ---"
-  awk -v D="$domain" '
-    BEGIN{L="";A="";S="0"}
-    /^[ \t]*listener[ \t]+/ {L=$2;A="";S="0"; print; next}
-    /^[ \t]*address[ \t]+/  {print; next}
-    /^[ \t]*secure[ \t]+/   {print; next}
-    /^[ \t]*map[ \t]+/      { if (index(tolower($0),tolower(D))) print }
-    /^[ \t]*}/              {print}
-  ' "$httpd" | sed 's/^/  /'
 }
 
-# ===================== Commands =====================
-
+# ---------- Commands ----------
 cmd_check(){
-  need awk; need sed; need grep
-  ols_paths
-  local domain="$1"; local vhconf=""
+  need awk; need sed; need grep; ols_paths
+  local domain="$1" vhconf docroot p
   vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
-  local docroot=""; docroot="$(docroot_from_vhconf "$vhconf" || true)"
+  docroot="$(docroot_from_vhconf "$vhconf" || true)"
   [[ -z "$docroot" ]] && docroot="/home/$domain/public_html"
-
   echo "LSWS_ROOT=$LSWS_ROOT"
   echo "CONF_DIR=$CONF_DIR"
   echo "VHOSTS_DIR=$VHOSTS_DIR"
   echo "HTTPD_CONF=$HTTPD_CONF"
   echo "VHCONF=$vhconf"
   echo "DOCROOT=$docroot"
-  local p="$(get_port_from_service "$domain" || true)"
+  p="$(get_port_from_service "$domain" || true)"
   echo "PORT=${p:-'(not assigned yet)'}"
-
-  # if we can infer the vhost name, show the reverse proxy context presence
-  local vhname; vhname="$(basename "$(dirname "$vhconf")")"
-  if [[ -f "$vhconf" ]]; then
-    local has_context; has_context="$(awk '/^context[ \t]+\/[ \t]*\{/,/^\}/' "$vhconf" | grep -F "proxyExtAppName" -m1 || true)"
-    if [[ -n "$has_context" ]]; then
-      echo "PROXY=present (proxyExtAppName)"
-    else
-      echo "PROXY=not present"
-    fi
-  fi
 }
-
 cmd_port(){ ols_paths; get_port_from_service "$1"; }
-
 cmd_logs(){
   local domain="$1"; shift || true
   local lines=200 follow=0
@@ -456,44 +382,36 @@ cmd_logs(){
       *) break;;
     esac
   done
-  local unit; unit="$(service_name "$domain")"
   if [[ "$follow" -eq 1 ]]; then
-    journalctl -u "$unit" -f
+    journalctl -u "$(service_name "$domain")" -f
   else
-    journalctl -u "$unit" -n "${lines}"
+    journalctl -u "$(service_name "$domain")" -n "$lines"
   fi
 }
-
 cmd_redeploy(){
   if [[ $# -eq 0 ]]; then
     systemctl list-units 'dotnet-app@*.service' --no-legend | awk '{print $1}' | while read -r u; do systemctl restart "$u" || true; done
     echo "Redeployed all"
   else
-    local domain="$1"
-    systemctl restart "$(service_name "$domain")"
-    echo "Redeployed $domain"
+    systemctl restart "$(service_name "$1")"
+    echo "Redeployed $1"
   fi
 }
-
 cmd_disable(){
   ols_paths
-  local domain="$1"
+  local domain="$1" vhconf
   systemctl stop "$(service_name "$domain")" || true
   systemctl disable "$(service_name "$domain")" || true
-
-  local vhconf; vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
+  vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
   sed -i '/^# >>> cyberpanel-dotnet BEGIN/,/^# <<< cyberpanel-dotnet END/d' "$vhconf" || true
   sed -i '/^# >>> cyberpanel-dotnet EXTAPP BEGIN/,/^# <<< cyberpanel-dotnet EXTAPP END/d' "$vhconf" || true
   remove_root_contexts "$vhconf" || true
   ols_reload
   echo "Disabled $domain"
 }
-
 cmd_enable(){
-  need awk; need sed; need grep
-  ols_paths
-
-  local domain="" dll="" port="" vhconf="" docroot="" user="" uid="" override_vh=""
+  need awk; need sed; need grep; ols_paths
+  local domain="" dll="" port="" override_vh=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dll) dll="$2"; shift 2;;
@@ -505,42 +423,36 @@ cmd_enable(){
   done
   [[ -n "$domain" ]] || err "Usage: enable <domain> --dll YourApp.dll"
 
+  local vhconf docroot dll_path user uid vhname envf unit
   vhconf="$(vhconf_for "$domain" "$override_vh")"
   docroot="$(workdir_for_domain "$domain" "$vhconf")"
-  dll="$(resolve_dll "$docroot" "$dll")"
+  dll_path="$(resolve_dll "$docroot" "$dll")"
 
-  # infer user/uid from docroot owner
   uid="$(stat -c '%u' "$docroot" 2>/dev/null || echo 0)"
   user="$(getent passwd "$uid" | cut -d: -f1 || true)"
   [[ -n "$user" ]] || user="www-data"
 
-  # port
   if [[ -z "${port:-}" ]]; then
     port="$(get_port_from_service "$domain" || true)"
     [[ -z "$port" ]] && port="$(alloc_port "$domain")"
   fi
 
-  # write env
-  local envf; envf="$(envfile_path "$domain")"
+  envf="$(envfile_path "$domain")"
   cat >"$envf" <<EOF
 DOMAIN=$domain
 DOCROOT=$docroot
 PORT=$port
 USER=$user
-DLL_PATH=$dll
+DLL_PATH=$dll_path
 EOF
   chmod 0644 "$envf"
 
-  # ensure service is enabled + started
-  local unit; unit="$(service_name "$domain")"
+  unit="$(service_name "$domain")"
   systemctl daemon-reload || true
   systemctl enable "$unit" >/dev/null 2>&1 || true
   systemctl restart "$unit"
 
-  # vhost name for blocks
-  local vhname; vhname="$(basename "$(dirname "$vhconf")")"
-
-  # ensure vhost enabled + vhDomain + proxy blocks + mappings
+  vhname="$(basename "$(dirname "$vhconf")")"
   ensure_vhost_enabled "$vhname"
   ensure_vhDomain "$vhconf" "$domain"
   ensure_extproxy_and_root "$vhconf" "$vhname" "$port"
@@ -562,16 +474,15 @@ EOF
   echo " • Check detected:   sudo cyberpanel-dotnet check $domain"
   echo "------------------------------------------------------------"
 }
-
 cmd_fixmap(){
   ols_paths
-  local domain="$1"
-  local vhconf; vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
-  local vhname; vhname="$(basename "$(dirname "$vhconf")")"
+  local domain="$1" vhconf vhname
+  vhconf="$(vhconf_for "$domain" "${VHCONF_OVERRIDE:-}")"
+  vhname="$(basename "$(dirname "$vhconf")")"
   fix_listener_mappings "$domain" "$vhname"
 }
 
-# ===================== CLI =====================
+# ---------- CLI ----------
 usage(){
   cat <<EOF
 cyberpanel-dotnet — make ASP.NET Core deploy like PHP on CyberPanel
@@ -584,28 +495,21 @@ Usage:
   cyberpanel-dotnet logs <domain> [--lines N|-n N] [-f]
   cyberpanel-dotnet check <domain>
   cyberpanel-dotnet fixmap <domain>
-
-Examples:
-  sudo cyberpanel-dotnet enable flezora.com --dll WebRTCVideoCall.dll
-  sudo cyberpanel-dotnet redeploy flezora.com
-  sudo cyberpanel-dotnet fixmap flezora.com
 EOF
 }
-
 main(){
   [[ $# -ge 1 ]] || { usage; exit 1; }
   local cmd="$1"; shift || true
   case "$cmd" in
-    enable)      cmd_enable "$@";;
-    disable)     [[ $# -ge 1 ]] || err "Usage: disable <domain>"; cmd_disable "$@";;
-    redeploy)    cmd_redeploy "$@";;
-    port)        [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
-    logs)        [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
-    check)       [[ $# -ge 1 ]] || err "Usage: check <domain>"; cmd_check "$@";;
-    fixmap)      [[ $# -ge 1 ]] || err "Usage: fixmap <domain>"; cmd_fixmap "$@";;
+    enable)   cmd_enable "$@";;
+    disable)  [[ $# -ge 1 ]] || err "Usage: disable <domain>"; cmd_disable "$@";;
+    redeploy) cmd_redeploy "$@";;
+    port)     [[ $# -ge 1 ]] || err "Usage: port <domain>"; cmd_port "$@";;
+    logs)     [[ $# -ge 1 ]] || err "Usage: logs <domain> [--lines N|-n N] [-f]"; cmd_logs "$@";;
+    check)    [[ $# -ge 1 ]] || err "Usage: check <domain>"; cmd_check "$@";;
+    fixmap)   [[ $# -ge 1 ]] || err "Usage: fixmap <domain>"; cmd_fixmap "$@";;
     -h|--help|help) usage;;
     *) err "Unknown command: $cmd";;
-  }
+  esac
 }
-
 main "$@"

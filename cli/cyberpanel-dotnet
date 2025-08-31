@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.3
+cyberpanel-dotnet v1.0.4
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -81,12 +81,21 @@ ensure_perms(){
   chmod -R 770 "$app/wwwroot/uploads" 2>/dev/null || true
 }
 
-# --- OLS include writers -----------------------------------------------------
+# --- Include writers (canonical templates) ----------------------------------
 
-write_dotnet_conf(){
-  # IMPORTANT: SignalR header forwarding is intentionally NOT included here by default.
-  # Users can enable it via: cyberpanel-dotnet signalr <domain> on
-  local dir="$1" port="$2"
+_write_dotnet_conf(){
+  # $1=dir  $2=port  $3=ws_flag ("on"|"off")
+  local dir="$1" port="$2" ws="$3"
+  # Build the context with/without the WS header forwarding lines
+  local ws_lines=""
+  if [[ "$ws" == "on" ]]; then
+    ws_lines=$(cat <<'WS'
+  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"
+  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"
+WS
+)
+  fi
+
   cat >"${dir}/dotnet-mode.conf" <<EOF
 extprocessor dotnet_backend {
   type                    proxy
@@ -96,19 +105,30 @@ extprocessor dotnet_backend {
   retryTimeout            0
   respBuffer              0
 }
+
 context / {
   type                    proxy
   handler                 dotnet_backend
+
   enableRewrite           1
-  rewriteCond             %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
-  rewriteRule             .* - [F,L]
-  rewriteCond             %{REQUEST_URI} (appsettings\.json|appsettings\..*\.json|\.env|\.ini|\.config)$
-  rewriteRule             .* - [F,L]
-  rewriteCond             %{REQUEST_URI} \.(sqlite|db|bak|zip|tar\.gz)$
-  rewriteRule             .* - [F,L]
+  rewriteCond             %{HTTP:Upgrade} =websocket
+  rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]
+
+${ws_lines}
+  rewrite  {
+    rewriteCond %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
+    rewriteRule .* - [F,L]
+    rewriteCond %{REQUEST_URI} (appsettings\.json|appsettings\..*\.json|\.env|\.ini|\.config)$
+    rewriteRule .* - [F,L]
+    rewriteCond %{REQUEST_URI} \.(sqlite|db|bak|zip|tar\.gz)$
+    rewriteRule .* - [F,L]
+  }
 }
 EOF
 }
+
+write_dotnet_conf_off(){ _write_dotnet_conf "$1" "$2" "off"; }
+write_dotnet_conf_on(){  _write_dotnet_conf "$1" "$2" "on";  }
 
 write_php_conf(){
   local dir="$1"
@@ -188,7 +208,7 @@ EOF
   systemctl restart "dotnet-${domain}.service"
 
   local inc; inc="$(ensure_includes "$domain")"
-  write_dotnet_conf "$inc" "$port"
+  write_dotnet_conf_off "$inc" "$port"      # default: WS OFF
   write_php_conf "$inc"
   set_autoindex_off "$vhost"
   ensure_line_in_file "# cyberpanel-dotnet include (do not remove)" "$vhost"
@@ -260,29 +280,46 @@ disable_cmd(){
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 
-# --- NEW: SignalR/WebSocket header toggle -----------------------------------
+# --- SignalR/WebSocket header toggle (regenerates include cleanly) -----------
+
+_get_port_from_include(){
+  # $1 = include file
+  local inc="$1"
+  local p
+  p="$(grep -Eo 'address\s+127\.0\.0\.1:([0-9]+)' "$inc" | grep -Eo '[0-9]+' | head -n1 || true)"
+  echo "${p:-}"
+}
+
+_get_port_from_app(){
+  # $1 = domain
+  local domain="$1"
+  local pf="/home/${domain}/public_html/NetCoreApp/.dotnet-port"
+  [[ -f "$pf" ]] && cat "$pf" || echo ""
+}
 
 signalr_cmd(){
   require_root
   local domain="${1:-}"; local state="${2:-}"
   [[ -n "$domain" && -n "$state" ]] || err "Usage: signalr <domain> on|off"
 
-  local conf="/usr/local/lsws/conf/vhosts/${domain}/includes/dotnet-mode.conf"
-  [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain}"
+  local inc_dir="/usr/local/lsws/conf/vhosts/${domain}/includes"
+  local conf="${inc_dir}/dotnet-mode.conf"
+  [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain} (run 'enable' first)."
+
+  # Determine port (from include if possible, else from .dotnet-port)
+  local port; port="$(_get_port_from_include "$conf")"
+  if [[ -z "$port" ]]; then
+    port="$(_get_port_from_app "$domain")"
+  fi
+  [[ -n "$port" ]] || err "Unable to determine backend port for ${domain}."
 
   case "$state" in
     on)
-      # ensure rewrite env exporters exist
-      grep -q 'rewriteCond.*HTTP:Upgrade.*=websocket' "$conf" || \
-        sed -i '/handler\s\+dotnet_backend/a\ \ \ rewriteCond             %{HTTP:Upgrade} =websocket\n  rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]' "$conf"
-      # add header forwarding
-      grep -q 'requestHeader set "Upgrade"' "$conf" || echo '  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"' >> "$conf"
-      grep -q 'requestHeader set "Connection"' "$conf" || echo '  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"' >> "$conf"
+      write_dotnet_conf_on "$inc_dir" "$port"
       ok "Enabled SignalR/WebSocket headers for ${domain}"
       ;;
     off)
-      sed -i '/requestHeader set "Upgrade"/d' "$conf"
-      sed -i '/requestHeader set "Connection"/d' "$conf"
+      write_dotnet_conf_off "$inc_dir" "$port"
       ok "Disabled SignalR/WebSocket headers for ${domain}"
       ;;
     *)
@@ -290,7 +327,7 @@ signalr_cmd(){
       ;;
   esac
 
-  systemctl restart lsws
+  restart_ols
 }
 
 main(){

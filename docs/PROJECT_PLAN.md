@@ -11,8 +11,6 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main/install.sh | sudo bash
 ```
-- Installs CLI binary `cyberpanel-dotnet` into `/usr/local/bin/`
-- No config required
 
 ### Upload your .NET Core build
 ```bash
@@ -25,33 +23,28 @@ dotnet publish -c Release -o publish
 ```bash
 sudo cyberpanel-dotnet enable <domain> --dll <MainDll>
 ```
-- Auto-selects a free port (50xxx) and writes `.dotnet-port`
-- Creates systemd service `dotnet-<domain>.service`
-- Adds OpenLiteSpeed includes: `dotnet-mode.conf`, `php-mode.conf`, and `app-mode.conf` (symlink)
-- Enables reverse-proxy at `/` with WebSockets
-- Denies sensitive files and disables autoIndex
-- Restarts OLS + starts the app
 
 ---
 
 ## 2) Daily Operations
 
-- **Deploy**
-  ```bash
-  sudo cyberpanel-dotnet deploy <domain> [--from <dir>]
-  # or upload manually then:
-  systemctl restart dotnet-<domain>
-  ```
+```bash
+sudo cyberpanel-dotnet deploy <domain> [--from <dir>]
+sudo cyberpanel-dotnet toggle <domain> php|dotnet
+sudo cyberpanel-dotnet disable <domain> [--purge]
+```
 
-- **Toggle**
-  ```bash
-  sudo cyberpanel-dotnet toggle <domain> php
-  sudo cyberpanel-dotnet toggle <domain> dotnet
-  ```
+#### SignalR / WebSocket toggle
 
-- **Disable**
+By default, WebSocket forwarding is **disabled**. Enable only when required.
+
+- Enable SignalR support:
   ```bash
-  sudo cyberpanel-dotnet disable <domain> [--purge]
+  sudo cyberpanel-dotnet signalr <domain> on
+  ```
+- Disable SignalR support:
+  ```bash
+  sudo cyberpanel-dotnet signalr <domain> off
   ```
 
 ---
@@ -61,7 +54,7 @@ sudo cyberpanel-dotnet enable <domain> --dll <MainDll>
 ```
 Client ──HTTPS──▶ OpenLiteSpeed (CyberPanel)
                        │
-                       ▼ reverse proxy (HTTP + WS upgrade)
+                       ▼ reverse proxy (HTTP + WS upgrade if enabled)
                  127.0.0.1:<random_port>
                        │
                        ▼
@@ -70,21 +63,12 @@ Client ──HTTPS──▶ OpenLiteSpeed (CyberPanel)
 
 ---
 
-## 4) Security Defaults
+## 4) Security & Permissions
 
 - Deny serving of: `.dll`, `.exe`, `.pdb`, `.deps.json`, `.runtimeconfig.json`,
   `appsettings*.json`, `.env`, `.ini`, `.config`, `.sqlite`, `.db`, `.bak`, `.zip`, `.tar.gz`,
   `.ps1`, `.cmd`, `.sh`
 - `autoIndex 0` in vhost
 - PHP mode blocks `/NetCoreApp/**`
-
----
-
-## 5) Acceptance Criteria
-
-- One-liner installs the CLI
-- `enable` brings the site live at `/`
-- Deploys are upload + restart
-- Toggle PHP/.NET works in a single command
-- Disable reverts to PHP and removes the service
-- Config edits are idempotent; vhost gets a backup
+- **Permissions auto-fix**: app files readable; `wwwroot/uploads` writable by service user
+- SignalR/WebSocket forwarding is OFF by default, must be explicitly enabled.

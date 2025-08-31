@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.4
+cyberpanel-dotnet v1.0.5
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -61,10 +61,9 @@ ensure_includes(){ local d="/usr/local/lsws/conf/vhosts/$1/includes"; mkdir -p "
 ensure_line_in_file(){ local line="$1" file="$2"; grep -qF "$line" "$file" || echo "$line" >> "$file"; }
 set_autoindex_off(){ local v="$1"; grep -qE '^\s*autoIndex\s+' "$v" || echo "autoIndex 0" >> "$v"; }
 
-# --- Permissions helpers -----------------------------------------------------
+# ---------------- Permissions helpers ----------------
 
 ensure_parent_perms(){
-  # Ensure parent dirs are traversable so www-data can reach the app folder
   local domain="$1"
   chmod 755 "/home/${domain}" 2>/dev/null || true
   chmod 755 "/home/${domain}/public_html" 2>/dev/null || true
@@ -72,31 +71,24 @@ ensure_parent_perms(){
 
 ensure_perms(){
   local app="$1"
-  # Directories readable/traversable, files readable
   find "$app" -type d -exec chmod 755 {} \; 2>/dev/null || true
   find "$app" -type f -exec chmod 644 {} \; 2>/dev/null || true
-  # Ensure uploads exists and is writable by the app
   mkdir -p "$app/wwwroot/uploads"
   chown -R www-data:www-data "$app/wwwroot/uploads" 2>/dev/null || true
   chmod -R 770 "$app/wwwroot/uploads" 2>/dev/null || true
 }
 
-# --- Include writers (canonical templates) ----------------------------------
+# --------------- Include writers (canonical) ---------------
 
-_write_dotnet_conf(){
-  # $1=dir  $2=port  $3=ws_flag ("on"|"off")
-  local dir="$1" port="$2" ws="$3"
-  # Build the context with/without the WS header forwarding lines
+_write_dotnet_conf_file(){
+  # $1=dest_file  $2=port  $3=ws_flag ("on"|"off")
+  local dest="$1" ; local port="$2" ; local ws="$3"
   local ws_lines=""
   if [[ "$ws" == "on" ]]; then
-    ws_lines=$(cat <<'WS'
-  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"
-  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"
-WS
-)
+    ws_lines=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"'
   fi
 
-  cat >"${dir}/dotnet-mode.conf" <<EOF
+  cat >"$dest" <<EOF
 extprocessor dotnet_backend {
   type                    proxy
   address                 127.0.0.1:${port}
@@ -127,8 +119,8 @@ ${ws_lines}
 EOF
 }
 
-write_dotnet_conf_off(){ _write_dotnet_conf "$1" "$2" "off"; }
-write_dotnet_conf_on(){  _write_dotnet_conf "$1" "$2" "on";  }
+write_dotnet_conf_off(){ _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "off"; }
+write_dotnet_conf_on(){  _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "on";  }
 
 write_php_conf(){
   local dir="$1"
@@ -153,7 +145,7 @@ link_mode(){
 restart_ols(){ systemctl restart lsws; }
 status_service(){ systemctl --no-pager --lines=20 status "dotnet-$1" || true; }
 
-# --- Commands ----------------------------------------------------------------
+# ---------------- Commands ----------------
 
 enable_cmd(){
   require_root
@@ -179,11 +171,9 @@ enable_cmd(){
   local port; port="$(pick_port "$app")"
   info "Using port ${port}"
 
-  # Ensure parents + app perms before starting the service
   ensure_parent_perms "$domain"
   ensure_perms "$app"
 
-  # systemd unit
   cat >"/etc/systemd/system/dotnet-${domain}.service" <<EOF
 [Unit]
 Description=.NET app for ${domain} (public_html/NetCoreApp)
@@ -239,7 +229,6 @@ deploy_cmd(){
     rsync -a --delete --exclude 'wwwroot/uploads/' "$from"/ "$app"/
   fi
 
-  # Re-apply permissions after deploy (covers FTP/rsync ownership differences)
   ensure_parent_perms "$domain"
   ensure_perms "$app"
 
@@ -271,7 +260,10 @@ disable_cmd(){
     esac
   done
   local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
-  if [[ -d "$inc" ]]; then link_mode "$inc" "php-mode.conf" || true; restart_ols || true; fi
+  if [[ -d "$inc" ]]; then
+    link_mode "$inc" "php-mode.conf" || true
+    restart_ols || true
+  fi
   systemctl stop "dotnet-${domain}.service" 2>/dev/null || true
   systemctl disable "dotnet-${domain}.service" 2>/dev/null || true
   rm -f "/etc/systemd/system/dotnet-${domain}.service"
@@ -280,21 +272,17 @@ disable_cmd(){
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 
-# --- SignalR/WebSocket header toggle (regenerates include cleanly) -----------
+# --------------- SignalR/WebSocket toggle (safe) ---------------
 
 _get_port_from_include(){
-  # $1 = include file
-  local inc="$1"
-  local p
-  p="$(grep -Eo 'address\s+127\.0\.0\.1:([0-9]+)' "$inc" | grep -Eo '[0-9]+' | head -n1 || true)"
-  echo "${p:-}"
+  # extract digits AFTER the colon in: address 127.0.0.1:<port>
+  sed -n 's/.*address[[:space:]]\+127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$1" | head -n1
 }
 
 _get_port_from_app(){
-  # $1 = domain
   local domain="$1"
   local pf="/home/${domain}/public_html/NetCoreApp/.dotnet-port"
-  [[ -f "$pf" ]] && cat "$pf" || echo ""
+  [[ -f "$pf" ]] && awk '{print $1}' "$pf" | grep -E '^[0-9]+$' || echo ""
 }
 
 signalr_cmd(){
@@ -306,30 +294,31 @@ signalr_cmd(){
   local conf="${inc_dir}/dotnet-mode.conf"
   [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain} (run 'enable' first)."
 
-  # Determine port (prefer include; fallback to .dotnet-port)
+  # get port safely
   local port
-  port="$(grep -Eo 'address\s+127\.0\.0\.1:([0-9]+)' "$conf" | grep -Eo '[0-9]+' | head -n1 || true)"
-  [[ -z "$port" ]] && port="$(cat "/home/${domain}/public_html/NetCoreApp/.dotnet-port" 2>/dev/null || true)"
+  port="$(_get_port_from_include "$conf")"
+  [[ -z "$port" ]] && port="$(_get_port_from_app "$domain")"
   [[ -n "$port" ]] || err "Unable to determine backend port for ${domain}."
 
-  # Backup current include
-  cp -a "$conf" "${conf}.bak.$(date +%s)"
+  # backup current include
+  local backup="${conf}.bak.$(date +%s)"
+  cp -a "$conf" "$backup"
 
-  # Write to a temp file first
+  # write a temp new file from the canonical template
   local tmp="${conf}.tmp.$$"
   case "$state" in
-    on)  _write_dotnet_conf "$inc_dir" "$port" "on"  ; mv -f "${inc_dir}/dotnet-mode.conf" "$tmp" ;;  # generate into final path then move to tmp
-    off) _write_dotnet_conf "$inc_dir" "$port" "off" ; mv -f "${inc_dir}/dotnet-mode.conf" "$tmp" ;;
+    on)  _write_dotnet_conf_file "$tmp" "$port" "on"  ;;
+    off) _write_dotnet_conf_file "$tmp" "$port" "off" ;;
     *)   err "Unknown state: $state (use on|off)";;
   esac
 
-  # Atomically replace the include
+  # atomic replace
   mv -f "$tmp" "$conf"
 
-  # Restart OLS and verify it stays up (basic smoke)
+  # restart OLS; if it fails, roll back
   if ! systemctl restart lsws; then
     echo "[X] OpenLiteSpeed restart failed. Restoring previous config..." >&2
-    mv -f "${conf}.bak."* "$conf" 2>/dev/null || true
+    mv -f "$backup" "$conf" 2>/dev/null || true
     systemctl restart lsws || true
     exit 1
   fi
@@ -337,15 +326,16 @@ signalr_cmd(){
   ok "SignalR/WebSocket headers ${state} for ${domain} (port ${port})"
 }
 
+# ---------------- Main ----------------
 
 main(){
   [[ $# -lt 1 ]] && { usage; exit 1; }
   case "$1" in
     --help|-h) usage;;
     --version) echo "$VERSION";;
-    enable) shift; [[ $# -ge 1 ]] || err "enable <domain> --dll <MainDll>"; enable_cmd "$@";;
-    deploy) shift; [[ $# -ge 1 ]] || err "deploy <domain> [--from <dir>]"; deploy_cmd "$@";;
-    toggle) shift; [[ $# -ge 2 ]] || err "toggle <domain> php|dotnet"; toggle_cmd "$@";;
+    enable)  shift; [[ $# -ge 1 ]] || err "enable <domain> --dll <MainDll>"; enable_cmd "$@";;
+    deploy)  shift; [[ $# -ge 1 ]] || err "deploy <domain> [--from <dir>]"; deploy_cmd "$@";;
+    toggle)  shift; [[ $# -ge 2 ]] || err "toggle <domain> php|dotnet"; toggle_cmd "$@";;
     disable) shift; [[ $# -ge 1 ]] || err "disable <domain> [--purge]"; disable_cmd "$@";;
     signalr) shift; [[ $# -ge 2 ]] || err "signalr <domain> on|off"; signalr_cmd "$@";;
     *) usage; err "Unknown command: $1";;

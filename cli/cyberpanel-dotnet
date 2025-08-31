@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.2
+cyberpanel-dotnet v1.0.3
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
   cyberpanel-dotnet deploy <domain> [--from <dir>]
   cyberpanel-dotnet toggle <domain> php|dotnet
   cyberpanel-dotnet disable <domain> [--purge]
+  cyberpanel-dotnet signalr <domain> on|off
   cyberpanel-dotnet --help | -h
   cyberpanel-dotnet --version
 
 Notes:
 - App path: /home/<domain>/public_html/NetCoreApp
 - Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
+- SignalR/WebSockets is OFF by default. Enable per site:
+    sudo cyberpanel-dotnet signalr <domain> on
 EOF
 }
 
@@ -58,7 +61,7 @@ ensure_includes(){ local d="/usr/local/lsws/conf/vhosts/$1/includes"; mkdir -p "
 ensure_line_in_file(){ local line="$1" file="$2"; grep -qF "$line" "$file" || echo "$line" >> "$file"; }
 set_autoindex_off(){ local v="$1"; grep -qE '^\s*autoIndex\s+' "$v" || echo "autoIndex 0" >> "$v"; }
 
-# --- NEW: permission helpers -------------------------------------------------
+# --- Permissions helpers -----------------------------------------------------
 
 ensure_parent_perms(){
   # Ensure parent dirs are traversable so www-data can reach the app folder
@@ -78,9 +81,11 @@ ensure_perms(){
   chmod -R 770 "$app/wwwroot/uploads" 2>/dev/null || true
 }
 
-# ---------------------------------------------------------------------------
+# --- OLS include writers -----------------------------------------------------
 
 write_dotnet_conf(){
+  # IMPORTANT: SignalR header forwarding is intentionally NOT included here by default.
+  # Users can enable it via: cyberpanel-dotnet signalr <domain> on
   local dir="$1" port="$2"
   cat >"${dir}/dotnet-mode.conf" <<EOF
 extprocessor dotnet_backend {
@@ -95,16 +100,12 @@ context / {
   type                    proxy
   handler                 dotnet_backend
   enableRewrite           1
-  rewriteCond             %{HTTP:Upgrade} =websocket
-  rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]
-}
-rewrite  {
-  rewriteCond %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
-  rewriteRule .* - [F,L]
-  rewriteCond %{REQUEST_URI} (appsettings\.json|appsettings\..*\.json|\.env|\.ini|\.config)$
-  rewriteRule .* - [F,L]
-  rewriteCond %{REQUEST_URI} \.(sqlite|db|bak|zip|tar\.gz)$
-  rewriteRule .* - [F,L]
+  rewriteCond             %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
+  rewriteRule             .* - [F,L]
+  rewriteCond             %{REQUEST_URI} (appsettings\.json|appsettings\..*\.json|\.env|\.ini|\.config)$
+  rewriteRule             .* - [F,L]
+  rewriteCond             %{REQUEST_URI} \.(sqlite|db|bak|zip|tar\.gz)$
+  rewriteRule             .* - [F,L]
 }
 EOF
 }
@@ -132,6 +133,8 @@ link_mode(){
 restart_ols(){ systemctl restart lsws; }
 status_service(){ systemctl --no-pager --lines=20 status "dotnet-$1" || true; }
 
+# --- Commands ----------------------------------------------------------------
+
 enable_cmd(){
   require_root
   need_bin dotnet
@@ -156,7 +159,7 @@ enable_cmd(){
   local port; port="$(pick_port "$app")"
   info "Using port ${port}"
 
-  # NEW: ensure parents + app perms before starting the service
+  # Ensure parents + app perms before starting the service
   ensure_parent_perms "$domain"
   ensure_perms "$app"
 
@@ -216,7 +219,7 @@ deploy_cmd(){
     rsync -a --delete --exclude 'wwwroot/uploads/' "$from"/ "$app"/
   fi
 
-  # NEW: re-apply permissions after deploy (covers FTP/rsync ownership differences)
+  # Re-apply permissions after deploy (covers FTP/rsync ownership differences)
   ensure_parent_perms "$domain"
   ensure_perms "$app"
 
@@ -257,6 +260,39 @@ disable_cmd(){
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 
+# --- NEW: SignalR/WebSocket header toggle -----------------------------------
+
+signalr_cmd(){
+  require_root
+  local domain="${1:-}"; local state="${2:-}"
+  [[ -n "$domain" && -n "$state" ]] || err "Usage: signalr <domain> on|off"
+
+  local conf="/usr/local/lsws/conf/vhosts/${domain}/includes/dotnet-mode.conf"
+  [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain}"
+
+  case "$state" in
+    on)
+      # ensure rewrite env exporters exist
+      grep -q 'rewriteCond.*HTTP:Upgrade.*=websocket' "$conf" || \
+        sed -i '/handler\s\+dotnet_backend/a\ \ \ rewriteCond             %{HTTP:Upgrade} =websocket\n  rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]' "$conf"
+      # add header forwarding
+      grep -q 'requestHeader set "Upgrade"' "$conf" || echo '  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"' >> "$conf"
+      grep -q 'requestHeader set "Connection"' "$conf" || echo '  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"' >> "$conf"
+      ok "Enabled SignalR/WebSocket headers for ${domain}"
+      ;;
+    off)
+      sed -i '/requestHeader set "Upgrade"/d' "$conf"
+      sed -i '/requestHeader set "Connection"/d' "$conf"
+      ok "Disabled SignalR/WebSocket headers for ${domain}"
+      ;;
+    *)
+      err "Unknown state: $state (use on|off)"
+      ;;
+  esac
+
+  systemctl restart lsws
+}
+
 main(){
   [[ $# -lt 1 ]] && { usage; exit 1; }
   case "$1" in
@@ -266,6 +302,7 @@ main(){
     deploy) shift; [[ $# -ge 1 ]] || err "deploy <domain> [--from <dir>]"; deploy_cmd "$@";;
     toggle) shift; [[ $# -ge 2 ]] || err "toggle <domain> php|dotnet"; toggle_cmd "$@";;
     disable) shift; [[ $# -ge 1 ]] || err "disable <domain> [--purge]"; disable_cmd "$@";;
+    signalr) shift; [[ $# -ge 2 ]] || err "signalr <domain> on|off"; signalr_cmd "$@";;
     *) usage; err "Unknown command: $1";;
   esac
 }

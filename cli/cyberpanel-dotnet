@@ -85,9 +85,12 @@ _write_dotnet_conf_file(){
   local dest="$1" ; local port="$2" ; local ws="$3"
   local ws_lines=""
   if [[ "$ws" == "on" ]]; then
-    ws_lines=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"'
+    ws_lines=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n'\
+$'  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"\n'\
+$'  requestHeader set "X-Forwarded-Proto" "https"\n'\
+$'  requestHeader set "X-Forwarded-Host"  "%{HTTP_HOST}"\n'\
+$'  requestHeader set "X-Forwarded-For"   "%{CLIENTIP}"'
   fi
-
   cat >"$dest" <<EOF
 extprocessor dotnet_backend {
   type                    proxy
@@ -118,6 +121,7 @@ ${ws_lines}
 }
 EOF
 }
+
 
 write_dotnet_conf_off(){ _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "off"; }
 write_dotnet_conf_on(){  _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "on";  }

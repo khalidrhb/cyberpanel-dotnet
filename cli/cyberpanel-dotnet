@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+
+usage() {
+  cat <<EOF
+cyberpanel-dotnet v${VERSION}
+
+Usage:
+  cyberpanel-dotnet enable <domain> --dll <MainDll>
+  cyberpanel-dotnet deploy <domain> [--from <dir>]
+  cyberpanel-dotnet toggle <domain> php|dotnet
+  cyberpanel-dotnet disable <domain> [--purge]
+  cyberpanel-dotnet --help | -h
+  cyberpanel-dotnet --version
+
+Notes:
+- App path: /home/<domain>/public_html/NetCoreApp
+- Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
+EOF
+}
+
+err(){ echo "[X] $*" >&2; exit 1; }
+info(){ echo "[i] $*"; }
+ok(){ echo "[✓] $*"; }
+
+require_root(){ [[ $EUID -eq 0 ]] || err "Run as root (sudo)."; }
+
+find_vhost(){
+  local domain="$1"
+  local base="/usr/local/lsws/conf/vhosts/${domain}"
+  local a="${base}/vhost.conf"
+  local b="${base}/vhconf.conf"
+  if [[ -f "$a" ]]; then echo "$a"; return; fi
+  if [[ -f "$b" ]]; then echo "$b"; return; fi
+  err "vhost not found for ${domain}. Create website in CyberPanel first."
+}
+
+backup_vhost(){
+  local vhost="$1"
+  cp -a "$vhost" "${vhost}.bak.$(date +%s)"
+}
+
+pick_port(){
+  local appdir="$1"
+  local pf="${appdir}/.dotnet-port"
+  if [[ -f "$pf" ]]; then cat "$pf"; return; fi
+  local p
+  for p in $(shuf -i 50000-50999 -n 100); do
+    if ! ss -ltn | grep -q ":$p "; then
+      echo "$p" > "$pf"
+      echo "$p"
+      return
+    fi
+  done
+  err "Failed to pick a free port"
+}
+
+ensure_includes(){
+  local domain="$1"
+  local dir="/usr/local/lsws/conf/vhosts/${domain}/includes"
+  mkdir -p "$dir"
+  echo "$dir"
+}
+
+ensure_line_in_file(){
+  local line="$1"; local file="$2"
+  grep -qF "$line" "$file" || echo "$line" >> "$file"
+}
+
+set_autoindex_off(){
+  local vhost="$1"
+  grep -qE '^\s*autoIndex\s+' "$vhost" || echo "autoIndex 0" >> "$vhost"
+}
+
+write_dotnet_conf(){
+  local dir="$1"; local port="$2"
+  cat >"${dir}/dotnet-mode.conf" <<EOF
+extprocessor dotnet_backend {
+  type                    proxy
+  address                 127.0.0.1:${port}
+  maxConns                200
+  initTimeout             60
+  retryTimeout            0
+  respBuffer              0
+}
+context / {
+  type                    proxy
+  handler                 dotnet_backend
+  enableRewrite           1
+  rewriteCond             %{HTTP:Upgrade} =websocket
+  rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]
+}
+rewrite  {
+  rewriteCond %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
+  rewriteRule .* - [F,L]
+  rewriteCond %{REQUEST_URI} (appsettings\.json|appsettings\..*\.json|\.env|\.ini|\.config)$
+  rewriteRule .* - [F,L]
+  rewriteCond %{REQUEST_URI} \.(sqlite|db|bak|zip|tar\.gz)$
+  rewriteRule .* - [F,L]
+}
+EOF
+}
+
+write_php_conf(){
+  local dir="$1"
+  cat >"${dir}/php-mode.conf" <<'EOF'
+index  {
+  useServer              0
+  indexFiles             index.php, index.html, index.htm
+}
+rewrite  {
+  rewriteCond %{REQUEST_URI} ^/NetCoreApp($|/.*)
+  rewriteRule .* - [F,L]
+}
+EOF
+}
+
+link_mode(){
+  local dir="$1"; local target="$2"
+  ln -sfn "${dir}/${target}" "${dir}/app-mode.conf"
+  chown lsadm:lsadm "${dir}/app-mode.conf" || true
+}
+
+restart_ols(){ systemctl restart lsws; }
+status_service(){ systemctl --no-pager --lines=20 status "dotnet-$1" || true; }
+
+enable_cmd(){
+  require_root
+  local domain="$1"; shift || true
+  local dll=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dll) dll="$2"; shift 2;;
+      *) err "Unknown arg: $1";;
+    fi
+  done
+  [[ -n "$domain" ]] || err "domain required"
+  [[ -n "$dll" ]] || err "--dll <MainDll> is required"
+
+  local pub="/home/${domain}/public_html"
+  local app="${pub}/NetCoreApp"
+  mkdir -p "${app}/wwwroot/uploads"
+
+  local vhost; vhost="$(find_vhost "$domain")"
+  backup_vhost "$vhost"
+
+  local port; port="$(pick_port "$app")"
+  info "Using port ${port}"
+
+  # systemd unit
+  cat >"/etc/systemd/system/dotnet-${domain}.service" <<EOF
+[Unit]
+Description=.NET app for ${domain} (public_html/NetCoreApp)
+After=network.target
+
+[Service]
+WorkingDirectory=${app}
+ExecStart=/usr/bin/dotnet ${app}/${dll} --urls http://127.0.0.1:${port}
+Restart=always
+RestartSec=2
+User=www-data
+Group=www-data
+Environment=ASPNETCORE_URLS=http://127.0.0.1:${port}
+Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "dotnet-${domain}.service" >/dev/null || true
+  systemctl restart "dotnet-${domain}.service"
+
+  # includes
+  local inc; inc="$(ensure_includes "$domain")"
+  write_dotnet_conf "$inc" "$port"
+  write_php_conf "$inc"
+  set_autoindex_off "$vhost"
+  ensure_line_in_file "# cyberpanel-dotnet include (do not remove)" "$vhost"
+  ensure_line_in_file "include ${inc}/app-mode.conf" "$vhost"
+  link_mode "$inc" "dotnet-mode.conf"
+
+  restart_ols
+  ok "Enabled .NET for ${domain} (port ${port}). App dir: ${app}"
+  status_service "$domain"
+}
+
+deploy_cmd(){
+  require_root
+  local domain="$1"; shift || true
+  local from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from="$2"; shift 2;;
+      *) err "Unknown arg: $1";;
+    fi
+  done
+  [[ -n "$domain" ]] || err "domain required"
+  local app="/home/${domain}/public_html/NetCoreApp"
+  [[ -d "$app" ]] || err "App dir not found: $app"
+  if [[ -n "$from" ]]; then
+    [[ -d "$from" ]] || err "Source dir not found: $from"
+    info "Deploying from $from to $app (keeping uploads)"
+    rsync -a --delete --exclude 'wwwroot/uploads/' "$from"/ "$app"/
+  else
+    info "No --from specified; skipping rsync"
+  fi
+  systemctl restart "dotnet-${domain}.service"
+  ok "Deployed and restarted dotnet-${domain}"
+}
+
+toggle_cmd(){
+  require_root
+  local domain="$1"; local mode="$2"
+  [[ -n "$domain" && -n "$mode" ]] || err "Usage: toggle <domain> php|dotnet"
+  local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
+  [[ -d "$inc" ]] || err "Includes dir not found: $inc"
+  case "$mode" in
+    php) link_mode "$inc" "php-mode.conf"; restart_ols; ok "Switched ${domain} to PHP mode";;
+    dotnet) link_mode "$inc" "dotnet-mode.conf"; restart_ols; systemctl restart "dotnet-${domain}.service"; ok "Switched ${domain} to .NET mode";;
+    *) err "Unknown mode: $mode";;
+  esac
+}
+
+disable_cmd(){
+  require_root
+  local domain="$1"; shift || true
+  local purge="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) purge="yes"; shift;;
+      *) err "Unknown arg: $1";;
+    fi
+  done
+  local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
+  if [[ -d "$inc" ]]; then
+    link_mode "$inc" "php-mode.conf" || true
+    restart_ols || true
+  fi
+  systemctl stop "dotnet-${domain}.service" || true
+  systemctl disable "dotnet-${domain}.service" || true
+  rm -f "/etc/systemd/system/dotnet-${domain}.service"
+  systemctl daemon-reload || true
+  if [[ "$purge" == "yes" ]]; then
+    rm -rf "/home/${domain}/public_html/NetCoreApp"
+  fi
+  ok "Disabled .NET for ${domain} (purge=${purge})"
+}
+
+main(){
+  [[ $# -lt 1 ]] && { usage; exit 1; }
+  case "$1" in
+    --help|-h) usage;;
+    --version) echo "$VERSION";;
+    enable) shift; [[ $# -ge 1 ]] || err "enable <domain> --dll <MainDll>"; enable_cmd "$@";;
+    deploy) shift; [[ $# -ge 1 ]] || err "deploy <domain> [--from <dir>]"; deploy_cmd "$@";;
+    toggle) shift; [[ $# -ge 2 ]] || err "toggle <domain> php|dotnet"; toggle_cmd "$@";;
+    disable) shift; [[ $# -ge 1 ]] || err "disable <domain> [--purge]"; disable_cmd "$@";;
+    *) usage; err "Unknown command: $1";;
+  esac
+}
+main "$@"

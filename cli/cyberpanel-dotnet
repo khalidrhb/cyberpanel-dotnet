@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.5"
+VERSION="1.0.6"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.5
+cyberpanel-dotnet v1.0.6
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -78,11 +78,14 @@ ensure_perms(){
   chmod -R 770 "$app/wwwroot/uploads" 2>/dev/null || true
 }
 
-# --------------- Include writers (canonical) ---------------
+# --------------- Include writers (canonical templates) ---------------
 
 _write_dotnet_conf_file(){
   # $1=dest_file  $2=port  $3=ws_flag ("on"|"off")
   local dest="$1" ; local port="$2" ; local ws="$3"
+
+  # When WS is enabled, also forward original scheme/host/client IP so ASP.NET
+  # can correctly handle HTTPS and origin during WS upgrade behind OLS.
   local ws_lines=""
   if [[ "$ws" == "on" ]]; then
     ws_lines=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n'\
@@ -91,6 +94,7 @@ $'  requestHeader set "X-Forwarded-Proto" "https"\n'\
 $'  requestHeader set "X-Forwarded-Host"  "%{HTTP_HOST}"\n'\
 $'  requestHeader set "X-Forwarded-For"   "%{CLIENTIP}"'
   fi
+
   cat >"$dest" <<EOF
 extprocessor dotnet_backend {
   type                    proxy
@@ -121,7 +125,6 @@ ${ws_lines}
 }
 EOF
 }
-
 
 write_dotnet_conf_off(){ _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "off"; }
 write_dotnet_conf_on(){  _write_dotnet_conf_file "$1/dotnet-mode.conf" "$2" "on";  }
@@ -276,7 +279,7 @@ disable_cmd(){
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 
-# --------------- SignalR/WebSocket toggle (safe) ---------------
+# --------------- SignalR/WebSocket toggle (safe & idempotent) ---------------
 
 _get_port_from_include(){
   # extract digits AFTER the colon in: address 127.0.0.1:<port>

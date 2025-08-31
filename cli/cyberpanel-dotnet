@@ -174,7 +174,7 @@ deploy_cmd(){
     case "$1" in
       --from) from="$2"; shift 2;;
       *) err "Unknown arg: $1";;
-    fi
+    esac
   done
   [[ -n "$domain" ]] || err "domain required"
   local app="/home/${domain}/public_html/NetCoreApp"
@@ -209,7 +209,7 @@ disable_cmd(){
     case "$1" in
       --purge) purge="yes"; shift;;
       *) err "Unknown arg: $1";;
-    fi
+    esac
   done
   local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
   if [[ -d "$inc" ]]; then link_mode "$inc" "php-mode.conf" || true; restart_ols || true; fi

@@ -306,29 +306,37 @@ signalr_cmd(){
   local conf="${inc_dir}/dotnet-mode.conf"
   [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain} (run 'enable' first)."
 
-  # Determine port (from include if possible, else from .dotnet-port)
-  local port; port="$(_get_port_from_include "$conf")"
-  if [[ -z "$port" ]]; then
-    port="$(_get_port_from_app "$domain")"
-  fi
+  # Determine port (prefer include; fallback to .dotnet-port)
+  local port
+  port="$(grep -Eo 'address\s+127\.0\.0\.1:([0-9]+)' "$conf" | grep -Eo '[0-9]+' | head -n1 || true)"
+  [[ -z "$port" ]] && port="$(cat "/home/${domain}/public_html/NetCoreApp/.dotnet-port" 2>/dev/null || true)"
   [[ -n "$port" ]] || err "Unable to determine backend port for ${domain}."
 
+  # Backup current include
+  cp -a "$conf" "${conf}.bak.$(date +%s)"
+
+  # Write to a temp file first
+  local tmp="${conf}.tmp.$$"
   case "$state" in
-    on)
-      write_dotnet_conf_on "$inc_dir" "$port"
-      ok "Enabled SignalR/WebSocket headers for ${domain}"
-      ;;
-    off)
-      write_dotnet_conf_off "$inc_dir" "$port"
-      ok "Disabled SignalR/WebSocket headers for ${domain}"
-      ;;
-    *)
-      err "Unknown state: $state (use on|off)"
-      ;;
+    on)  _write_dotnet_conf "$inc_dir" "$port" "on"  ; mv -f "${inc_dir}/dotnet-mode.conf" "$tmp" ;;  # generate into final path then move to tmp
+    off) _write_dotnet_conf "$inc_dir" "$port" "off" ; mv -f "${inc_dir}/dotnet-mode.conf" "$tmp" ;;
+    *)   err "Unknown state: $state (use on|off)";;
   esac
 
-  restart_ols
+  # Atomically replace the include
+  mv -f "$tmp" "$conf"
+
+  # Restart OLS and verify it stays up (basic smoke)
+  if ! systemctl restart lsws; then
+    echo "[X] OpenLiteSpeed restart failed. Restoring previous config..." >&2
+    mv -f "${conf}.bak."* "$conf" 2>/dev/null || true
+    systemctl restart lsws || true
+    exit 1
+  fi
+
+  ok "SignalR/WebSocket headers ${state} for ${domain} (port ${port})"
 }
+
 
 main(){
   [[ $# -lt 1 ]] && { usage; exit 1; }

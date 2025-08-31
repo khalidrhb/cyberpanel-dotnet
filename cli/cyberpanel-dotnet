@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.2"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.0
+cyberpanel-dotnet v1.0.2
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -14,6 +14,10 @@ Usage:
   cyberpanel-dotnet disable <domain> [--purge]
   cyberpanel-dotnet --help | -h
   cyberpanel-dotnet --version
+
+Notes:
+- App path: /home/<domain>/public_html/NetCoreApp
+- Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
 EOF
 }
 
@@ -53,6 +57,28 @@ pick_port(){
 ensure_includes(){ local d="/usr/local/lsws/conf/vhosts/$1/includes"; mkdir -p "$d"; echo "$d"; }
 ensure_line_in_file(){ local line="$1" file="$2"; grep -qF "$line" "$file" || echo "$line" >> "$file"; }
 set_autoindex_off(){ local v="$1"; grep -qE '^\s*autoIndex\s+' "$v" || echo "autoIndex 0" >> "$v"; }
+
+# --- NEW: permission helpers -------------------------------------------------
+
+ensure_parent_perms(){
+  # Ensure parent dirs are traversable so www-data can reach the app folder
+  local domain="$1"
+  chmod 755 "/home/${domain}" 2>/dev/null || true
+  chmod 755 "/home/${domain}/public_html" 2>/dev/null || true
+}
+
+ensure_perms(){
+  local app="$1"
+  # Directories readable/traversable, files readable
+  find "$app" -type d -exec chmod 755 {} \; 2>/dev/null || true
+  find "$app" -type f -exec chmod 644 {} \; 2>/dev/null || true
+  # Ensure uploads exists and is writable by the app
+  mkdir -p "$app/wwwroot/uploads"
+  chown -R www-data:www-data "$app/wwwroot/uploads" 2>/dev/null || true
+  chmod -R 770 "$app/wwwroot/uploads" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 
 write_dotnet_conf(){
   local dir="$1" port="$2"
@@ -130,6 +156,11 @@ enable_cmd(){
   local port; port="$(pick_port "$app")"
   info "Using port ${port}"
 
+  # NEW: ensure parents + app perms before starting the service
+  ensure_parent_perms "$domain"
+  ensure_perms "$app"
+
+  # systemd unit
   cat >"/etc/systemd/system/dotnet-${domain}.service" <<EOF
 [Unit]
 Description=.NET app for ${domain} (public_html/NetCoreApp)
@@ -184,6 +215,11 @@ deploy_cmd(){
     info "Deploying from $from to $app (keeping uploads)"
     rsync -a --delete --exclude 'wwwroot/uploads/' "$from"/ "$app"/
   fi
+
+  # NEW: re-apply permissions after deploy (covers FTP/rsync ownership differences)
+  ensure_parent_perms "$domain"
+  ensure_perms "$app"
+
   systemctl restart "dotnet-${domain}.service"
   ok "Deployed and restarted dotnet-${domain}"
 }

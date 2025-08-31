@@ -4,8 +4,8 @@ set -euo pipefail
 VERSION="1.0.0"
 
 usage() {
-  cat <<EOF
-cyberpanel-dotnet v${VERSION}
+  cat <<'EOF'
+cyberpanel-dotnet v1.0.0
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -14,10 +14,6 @@ Usage:
   cyberpanel-dotnet disable <domain> [--purge]
   cyberpanel-dotnet --help | -h
   cyberpanel-dotnet --version
-
-Notes:
-- App path: /home/<domain>/public_html/NetCoreApp
-- Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
 EOF
 }
 
@@ -26,56 +22,40 @@ info(){ echo "[i] $*"; }
 ok(){ echo "[✓] $*"; }
 
 require_root(){ [[ $EUID -eq 0 ]] || err "Run as root (sudo)."; }
+need_bin(){ command -v "$1" >/dev/null 2>&1 || err "Missing dependency: $1"; }
 
 find_vhost(){
   local domain="$1"
   local base="/usr/local/lsws/conf/vhosts/${domain}"
   local a="${base}/vhost.conf"
   local b="${base}/vhconf.conf"
-  if [[ -f "$a" ]]; then echo "$a"; return; fi
-  if [[ -f "$b" ]]; then echo "$b"; return; fi
-  err "vhost not found for ${domain}. Create website in CyberPanel first."
+  [[ -f "$a" ]] && { echo "$a"; return; }
+  [[ -f "$b" ]] && { echo "$b"; return; }
+  err "vhost not found for ${domain}. Create the website first in CyberPanel."
 }
 
-backup_vhost(){
-  local vhost="$1"
-  cp -a "$vhost" "${vhost}.bak.$(date +%s)"
-}
+backup_vhost(){ cp -a "$1" "$1.bak.$(date +%s)"; }
 
 pick_port(){
   local appdir="$1"
   local pf="${appdir}/.dotnet-port"
   if [[ -f "$pf" ]]; then cat "$pf"; return; fi
+  need_bin ss || true
   local p
-  for p in $(shuf -i 50000-50999 -n 100); do
-    if ! ss -ltn | grep -q ":$p "; then
-      echo "$p" > "$pf"
-      echo "$p"
-      return
+  for p in $(shuf -i 50000-50999 -n 200); do
+    if ! ss -ltn 2>/dev/null | grep -q ":$p " ; then
+      echo "$p" > "$pf"; echo "$p"; return
     fi
   done
   err "Failed to pick a free port"
 }
 
-ensure_includes(){
-  local domain="$1"
-  local dir="/usr/local/lsws/conf/vhosts/${domain}/includes"
-  mkdir -p "$dir"
-  echo "$dir"
-}
-
-ensure_line_in_file(){
-  local line="$1"; local file="$2"
-  grep -qF "$line" "$file" || echo "$line" >> "$file"
-}
-
-set_autoindex_off(){
-  local vhost="$1"
-  grep -qE '^\s*autoIndex\s+' "$vhost" || echo "autoIndex 0" >> "$vhost"
-}
+ensure_includes(){ local d="/usr/local/lsws/conf/vhosts/$1/includes"; mkdir -p "$d"; echo "$d"; }
+ensure_line_in_file(){ local line="$1" file="$2"; grep -qF "$line" "$file" || echo "$line" >> "$file"; }
+set_autoindex_off(){ local v="$1"; grep -qE '^\s*autoIndex\s+' "$v" || echo "autoIndex 0" >> "$v"; }
 
 write_dotnet_conf(){
-  local dir="$1"; local port="$2"
+  local dir="$1" port="$2"
   cat >"${dir}/dotnet-mode.conf" <<EOF
 extprocessor dotnet_backend {
   type                    proxy
@@ -118,9 +98,9 @@ EOF
 }
 
 link_mode(){
-  local dir="$1"; local target="$2"
+  local dir="$1" target="$2"
   ln -sfn "${dir}/${target}" "${dir}/app-mode.conf"
-  chown lsadm:lsadm "${dir}/app-mode.conf" || true
+  chown lsadm:lsadm "${dir}/app-mode.conf" 2>/dev/null || true
 }
 
 restart_ols(){ systemctl restart lsws; }
@@ -128,13 +108,14 @@ status_service(){ systemctl --no-pager --lines=20 status "dotnet-$1" || true; }
 
 enable_cmd(){
   require_root
+  need_bin dotnet
   local domain="$1"; shift || true
   local dll=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dll) dll="$2"; shift 2;;
+      --dll) dll="${2:-}"; shift 2;;
       *) err "Unknown arg: $1";;
-    fi
+    esac
   done
   [[ -n "$domain" ]] || err "domain required"
   [[ -n "$dll" ]] || err "--dll <MainDll> is required"
@@ -149,7 +130,6 @@ enable_cmd(){
   local port; port="$(pick_port "$app")"
   info "Using port ${port}"
 
-  # systemd unit
   cat >"/etc/systemd/system/dotnet-${domain}.service" <<EOF
 [Unit]
 Description=.NET app for ${domain} (public_html/NetCoreApp)
@@ -168,11 +148,11 @@ Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
   systemctl enable "dotnet-${domain}.service" >/dev/null || true
   systemctl restart "dotnet-${domain}.service"
 
-  # includes
   local inc; inc="$(ensure_includes "$domain")"
   write_dotnet_conf "$inc" "$port"
   write_php_conf "$inc"
@@ -188,7 +168,7 @@ EOF
 
 deploy_cmd(){
   require_root
-  local domain="$1"; shift || true
+  local domain="${1:-}"; shift || true
   local from=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -203,8 +183,6 @@ deploy_cmd(){
     [[ -d "$from" ]] || err "Source dir not found: $from"
     info "Deploying from $from to $app (keeping uploads)"
     rsync -a --delete --exclude 'wwwroot/uploads/' "$from"/ "$app"/
-  else
-    info "No --from specified; skipping rsync"
   fi
   systemctl restart "dotnet-${domain}.service"
   ok "Deployed and restarted dotnet-${domain}"
@@ -212,7 +190,7 @@ deploy_cmd(){
 
 toggle_cmd(){
   require_root
-  local domain="$1"; local mode="$2"
+  local domain="${1:-}"; local mode="${2:-}"
   [[ -n "$domain" && -n "$mode" ]] || err "Usage: toggle <domain> php|dotnet"
   local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
   [[ -d "$inc" ]] || err "Includes dir not found: $inc"
@@ -225,7 +203,7 @@ toggle_cmd(){
 
 disable_cmd(){
   require_root
-  local domain="$1"; shift || true
+  local domain="${1:-}"; shift || true
   local purge="no"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -234,17 +212,12 @@ disable_cmd(){
     fi
   done
   local inc="/usr/local/lsws/conf/vhosts/${domain}/includes"
-  if [[ -d "$inc" ]]; then
-    link_mode "$inc" "php-mode.conf" || true
-    restart_ols || true
-  fi
-  systemctl stop "dotnet-${domain}.service" || true
-  systemctl disable "dotnet-${domain}.service" || true
+  if [[ -d "$inc" ]]; then link_mode "$inc" "php-mode.conf" || true; restart_ols || true; fi
+  systemctl stop "dotnet-${domain}.service" 2>/dev/null || true
+  systemctl disable "dotnet-${domain}.service" 2>/dev/null || true
   rm -f "/etc/systemd/system/dotnet-${domain}.service"
   systemctl daemon-reload || true
-  if [[ "$purge" == "yes" ]]; then
-    rm -rf "/home/${domain}/public_html/NetCoreApp"
-  fi
+  if [[ "$purge" == "yes" ]]; then rm -rf "/home/${domain}/public_html/NetCoreApp"; fi
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 

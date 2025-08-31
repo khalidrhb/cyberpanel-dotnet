@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.6"
+VERSION="1.0.7"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.6
+cyberpanel-dotnet v1.0.7
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
@@ -21,6 +21,9 @@ Notes:
 - Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
 - SignalR/WebSockets is OFF by default. Enable per site:
     sudo cyberpanel-dotnet signalr <domain> on
+- When SignalR is ON, we:
+    * forward Upgrade/Connection + X-Forwarded-* headers
+    * add an explicit OpenLiteSpeed websocket context for /ConnectionHub
 EOF
 }
 
@@ -79,20 +82,31 @@ ensure_perms(){
 }
 
 # --------------- Include writers (canonical templates) ---------------
+# When WS=on we:
+#   - add header forwarding (Upgrade/Connection + X-Forwarded-*)
+#   - add explicit websocket context /ConnectionHub -> 127.0.0.1:<port>
 
 _write_dotnet_conf_file(){
   # $1=dest_file  $2=port  $3=ws_flag ("on"|"off")
   local dest="$1" ; local port="$2" ; local ws="$3"
 
-  # When WS is enabled, also forward original scheme/host/client IP so ASP.NET
-  # can correctly handle HTTPS and origin during WS upgrade behind OLS.
-  local ws_lines=""
+  local ws_headers=""
+  local ws_ctx=""
   if [[ "$ws" == "on" ]]; then
-    ws_lines=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n'\
+    ws_headers=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n'\
 $'  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"\n'\
 $'  requestHeader set "X-Forwarded-Proto" "https"\n'\
 $'  requestHeader set "X-Forwarded-Host"  "%{HTTP_HOST}"\n'\
 $'  requestHeader set "X-Forwarded-For"   "%{CLIENTIP}"'
+
+    ws_ctx=$(cat <<EOFCTX
+# WebSocket hub context (explicit mapping for /ConnectionHub)
+context /ConnectionHub {
+  type                    websocket
+  address                 127.0.0.1:${port}
+}
+EOFCTX
+)
   fi
 
   cat >"$dest" <<EOF
@@ -105,6 +119,7 @@ extprocessor dotnet_backend {
   respBuffer              0
 }
 
+${ws_ctx}
 context / {
   type                    proxy
   handler                 dotnet_backend
@@ -113,7 +128,7 @@ context / {
   rewriteCond             %{HTTP:Upgrade} =websocket
   rewriteRule             .* - [E=HTTP_UPGRADE:%{HTTP:Upgrade},E=HTTP_CONNECTION:%{HTTP:Connection}]
 
-${ws_lines}
+${ws_headers}
   rewrite  {
     rewriteCond %{REQUEST_URI} \.(dll|exe|pdb|deps\.json|runtimeconfig\.json|ps1|cmd|sh)$
     rewriteRule .* - [F,L]

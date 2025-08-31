@@ -10,7 +10,7 @@ echo "[i] Installing cyberpanel-dotnet CLI to ${TARGET}"
 curl -fsSL "${REPO_RAW}/cli/cyberpanel-dotnet" -o "${TARGET}"
 
 # Ensure Unix line endings
-sed -i 's/\r$//' "${TARGET}"
+sed -i 's/\r$//' "${TARGET}" || true
 
 # Make it executable
 chmod +x "${TARGET}"

@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<cyberpanelPluginConfig>
-  <name>cyberpanel_dotnet_plugin</name>
-  <type>plugin</type>
-  <description>CyberPanel .NET/SignalR manager UI. Runs cyberpanel-dotnet CLI to enable/deploy/toggle apps and configure hub paths.</description>
-  <version>2</version>
-</cyberpanelPluginConfig>

@@ -1,0 +1,1 @@
+default_app_config = 'cyberpanel_dotnet_plugin.apps.CyberpanelDotnetPluginConfig'

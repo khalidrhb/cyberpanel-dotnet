@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ----- Config -----
+# ===== Config =====
 REPO_RAW="https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main"
 
 CLI_PATH="/usr/local/bin/cyberpanel-dotnet"
@@ -10,20 +10,18 @@ SUDOERS_FILE="/etc/sudoers.d/cyberpanel-dotnet"
 PLUGIN_ROOT="/usr/local/CyberCP/pluginInstaller"
 PLUGIN_NAME="cyberpanel_dotnet_plugin"
 
-PANEL_DEFAULT_USER="lscpd"     # change with --panel-user if your panel user differs
+PANEL_DEFAULT_USER="lscpd"     # override with --panel-user=<user>
 MODE=""                        # cli | with-plugin
 PANEL_USER="${PANEL_DEFAULT_USER}"
 
-# ----- Helpers -----
+# ===== Helpers =====
 need_root(){ [[ $EUID -eq 0 ]] || { echo "[X] Run with sudo"; exit 1; }; }
 need_bin(){ command -v "$1" >/dev/null 2>&1 || { echo "[X] Missing: $1"; exit 1; }; }
 have_file(){ [[ -f "$1" ]]; }
 have_dir(){ [[ -d "$1" ]]; }
 
 detect_panel_user(){
-  # If user specified and exists, use it.
   if id -u "$PANEL_USER" >/dev/null 2>&1; then echo "$PANEL_USER"; return; fi
-  # Common panel users
   for u in lscpd cyberpanel www-data; do
     id -u "$u" >/dev/null 2>&1 && { echo "$u"; return; }
   done
@@ -32,7 +30,8 @@ detect_panel_user(){
 
 safe_write(){  # usage: curl ... | safe_write /path/to/file
   local file="$1" tmp="${file}.tmp.$$"
-  cat > "$tmp"; chmod 0644 "$tmp" || true
+  cat > "$tmp"
+  chmod 0644 "$tmp" || true
   [[ -f "$file" ]] && cp -a "$file" "${file}.bak.$(date +%s)" || true
   mv -f "$tmp" "$file"
 }
@@ -48,23 +47,19 @@ fetch_any(){  # fetch_any <dest> <relpath1> [relpath2] ...
   return 0
 }
 
-# ----- Installers -----
+# ===== Installers =====
 install_cli(){
   echo "[i] Installing CLI -> ${CLI_PATH}"
-  # main CLI
   fetch_any "${CLI_PATH}" \
     "cli/cyberpanel-dotnet" \
     "scripts/cyberpanel-dotnet" \
     "cyberpanel-dotnet"
   chmod 0755 "${CLI_PATH}"
 
-  # optional companions (install if present in repo)
+  # Optional helpers if present in repo
   for n in cyberpanel-dotnet-proxy cyberpanel-dotnet-wrapper dotnet-autodeploy; do
     dest="/usr/local/bin/${n}"
-    if fetch_any "$dest" \
-        "cli/${n}" \
-        "scripts/${n}" \
-        "${n}" 2>/dev/null; then
+    if fetch_any "$dest" "cli/${n}" "scripts/${n}" "${n}" 2>/dev/null; then
       chmod 0755 "$dest"
       echo "[i] Installed helper: $n"
     fi
@@ -125,7 +120,7 @@ install_plugin_from_repo(){
   echo "[✓] Plugin installed"
 }
 
-# ----- Args -----
+# ===== Args =====
 for arg in "$@"; do
   case "$arg" in
     --mode=cli) MODE="cli";;
@@ -153,27 +148,38 @@ USAGE
   esac
 done
 
-# ----- Preflight -----
+# ===== Preflight =====
 need_root
 need_bin curl
 need_bin bash
 command -v visudo >/dev/null 2>&1 || { echo "[X] visudo missing"; exit 1; }
 
-# ----- Prompt if not specified -----
+# ===== Interactive prompt (TTY-safe) =====
 if [[ -z "${MODE}" ]]; then
   echo "Select install mode:"
   echo "  1) CLI only"
   echo "  2) CLI + CyberPanel plugin (UI)"
-  read -rp "Enter choice [1-2] (default 2): " choice || true
-  case "${choice:-2}" in
-    1) MODE="cli";;
-    2|"") MODE="with-plugin";;
-    *) echo "[X] Invalid choice"; exit 1;;
+
+  choice=""
+  if [ -t 0 ]; then
+    read -rp "Enter choice [1-2] (default 2): " choice || true
+  else
+    # stdin is a pipe; try real terminal
+    if [ -r /dev/tty ]; then
+      read -rp "Enter choice [1-2] (default 2): " choice < /dev/tty || true
+    fi
+  fi
+
+  choice="${choice:-2}"
+  case "$choice" in
+    1) MODE="cli" ;;
+    2) MODE="with-plugin" ;;
+    *) MODE="with-plugin" ;;  # safe fallback
   esac
 fi
 echo "[i] Mode: ${MODE}"
 
-# ----- Do it -----
+# ===== Do it =====
 install_cli
 write_sudoers
 [[ "${MODE}" == "with-plugin" ]] && install_plugin_from_repo

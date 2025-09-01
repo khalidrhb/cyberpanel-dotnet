@@ -48,16 +48,16 @@ Enable it per site only if you use SignalR or another WebSocket-based feature.
 
 ```bash
 # Enable WebSocket header forwarding for default hub (/hub)
-sudo cyberpanel-dotnet signalr flezora.com on
+sudo cyberpanel-dotnet signalr YourAppDomain.com on
 
 # Enable for a single custom hub
-sudo cyberpanel-dotnet signalr flezora.com on /ConnectionHub
+sudo cyberpanel-dotnet signalr YourAppDomain.com on /ConnectionHub
 
 # Enable for multiple hubs
-sudo cyberpanel-dotnet signalr flezora.com on /hub /ConnectionHub /notifications
+sudo cyberpanel-dotnet signalr YourAppDomain.com on /hub /ConnectionHub /notifications
 
 # Disable it again (removes all SignalR contexts)
-sudo cyberpanel-dotnet signalr flezora.com off
+sudo cyberpanel-dotnet signalr YourAppDomain.com off
 ```
 
 ## What it does

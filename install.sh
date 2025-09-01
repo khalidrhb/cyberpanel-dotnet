@@ -25,9 +25,13 @@ detect_panel_user(){
   echo "$PANEL_DEFAULT_USER"
 }
 
+# read stdin -> temp file -> atomically move into place (backing up old)
 safe_write(){  # usage: curl ... | safe_write /path/to/file
-  local file="$1" tmp="${file}.tmp.$$"
-  cat > "$tmp"; chmod 0644 "$tmp" || true
+  if [[ $# -ne 1 ]]; then echo "[X] safe_write requires destination path" >&2; return 1; fi
+  local file; file="$1"
+  local tmp;  tmp="${file}.tmp.$$"
+  cat > "$tmp"
+  chmod 0644 "$tmp" || true
   [[ -f "$file" ]] && cp -a "$file" "${file}.bak.$(date +%s)" || true
   mv -f "$tmp" "$file"
 }

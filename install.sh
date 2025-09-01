@@ -1,48 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Repo raw prefix (your main branch) ---
+# ----- Config -----
 REPO_RAW="https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main"
 
 CLI_PATH="/usr/local/bin/cyberpanel-dotnet"
-SUDOERS_FILE="/etc/sudoers.d/kaypanel-dotnet"
+SUDOERS_FILE="/etc/sudoers.d/cyberpanel-dotnet"
+
 PLUGIN_ROOT="/usr/local/CyberCP/pluginInstaller"
 PLUGIN_NAME="cyberpanel_dotnet_plugin"
-PANEL_DEFAULT_USER="lscpd"
 
-MODE=""                 # cli | with-plugin
+PANEL_DEFAULT_USER="lscpd"     # change with --panel-user if your panel user differs
+MODE=""                        # cli | with-plugin
 PANEL_USER="${PANEL_DEFAULT_USER}"
 
+# ----- Helpers -----
 need_root(){ [[ $EUID -eq 0 ]] || { echo "[X] Run with sudo"; exit 1; }; }
 need_bin(){ command -v "$1" >/dev/null 2>&1 || { echo "[X] Missing: $1"; exit 1; }; }
 have_file(){ [[ -f "$1" ]]; }
 have_dir(){ [[ -d "$1" ]]; }
 
 detect_panel_user(){
-  # If a user was provided via --panel-user and exists, use it.
+  # If user specified and exists, use it.
   if id -u "$PANEL_USER" >/dev/null 2>&1; then echo "$PANEL_USER"; return; fi
-  # Common panel users, pick the first that exists:
+  # Common panel users
   for u in lscpd cyberpanel www-data; do
-    if id -u "$u" >/dev/null 2>&1; then echo "$u"; return; fi
+    id -u "$u" >/dev/null 2>&1 && { echo "$u"; return; }
   done
-  # Fallback
   echo "$PANEL_DEFAULT_USER"
 }
 
-safe_write(){
-  # Usage: curl ... | safe_write /path/to/file
-  local file="$1"
-  local tmp="${file}.tmp.$$"
-  cat > "$tmp"
-  chmod 0644 "$tmp" || true
+safe_write(){  # usage: curl ... | safe_write /path/to/file
+  local file="$1" tmp="${file}.tmp.$$"
+  cat > "$tmp"; chmod 0644 "$tmp" || true
   [[ -f "$file" ]] && cp -a "$file" "${file}.bak.$(date +%s)" || true
   mv -f "$tmp" "$file"
 }
 
+fetch_any(){  # fetch_any <dest> <relpath1> [relpath2] ...
+  local dest="$1"; shift
+  local rel url ok=0
+  for rel in "$@"; do
+    url="${REPO_RAW}/${rel}"
+    if curl -fsSL "$url" -o "$dest"; then ok=1; break; fi
+  done
+  [[ $ok -eq 1 ]] || { echo "[X] Failed to fetch: $*"; return 1; }
+  return 0
+}
+
+# ----- Installers -----
 install_cli(){
   echo "[i] Installing CLI -> ${CLI_PATH}"
-  curl -fsSL "${REPO_RAW}/cyberpanel-dotnet" -o "${CLI_PATH}"
+  # main CLI
+  fetch_any "${CLI_PATH}" \
+    "cli/cyberpanel-dotnet" \
+    "scripts/cyberpanel-dotnet" \
+    "cyberpanel-dotnet"
   chmod 0755 "${CLI_PATH}"
+
+  # optional companions (install if present in repo)
+  for n in cyberpanel-dotnet-proxy cyberpanel-dotnet-wrapper dotnet-autodeploy; do
+    dest="/usr/local/bin/${n}"
+    if fetch_any "$dest" \
+        "cli/${n}" \
+        "scripts/${n}" \
+        "${n}" 2>/dev/null; then
+      chmod 0755 "$dest"
+      echo "[i] Installed helper: $n"
+    fi
+  done
+
   echo "[✓] CLI installed: $("${CLI_PATH}" --version || echo "version unknown")"
 }
 
@@ -56,10 +83,9 @@ write_sudoers(){
 ${PANEL_USER} ALL=(root) NOPASSWD: ${CLI_PATH} *
 ${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart dotnet-*
 EOF
-
   chmod 0440 "${SUDOERS_FILE}"
   visudo -cf "${SUDOERS_FILE}" >/dev/null || { echo "[X] sudoers invalid" >&2; exit 1; }
-  echo "[✓] sudoers OK"
+  echo "[✓] sudoers OK at ${SUDOERS_FILE}"
 }
 
 install_plugin_from_repo(){
@@ -68,7 +94,7 @@ install_plugin_from_repo(){
     return 0
   fi
 
-  echo "[i] Installing plugin files to ${PLUGIN_ROOT}/${PLUGIN_NAME}"
+  echo "[i] Installing plugin -> ${PLUGIN_ROOT}/${PLUGIN_NAME}"
   mkdir -p "${PLUGIN_ROOT}/${PLUGIN_NAME}/templates/${PLUGIN_NAME}"
 
   curl -fsSL "${REPO_RAW}/plugin/${PLUGIN_NAME}/meta.xml" \
@@ -87,23 +113,19 @@ install_plugin_from_repo(){
   # Register plugin if pluginInstaller.py exists
   local pybin=""
   if command -v python3 >/dev/null 2>&1; then pybin="python3"
-  elif command -v python >/dev/null 2>&1; then pybin="python"
+  elif command -v python  >/dev/null 2>&1; then pybin="python"
   fi
-
   if [[ -n "$pybin" && -f "${PLUGIN_ROOT}/pluginInstaller.py" ]]; then
     echo "[i] Registering plugin via pluginInstaller.py"
     "$pybin" "${PLUGIN_ROOT}/pluginInstaller.py" install --pluginName "${PLUGIN_NAME}" || true
   fi
 
-  # Restart panel if present (service name varies; lscpd on many installs)
-  if systemctl list-unit-files | grep -q '^lscpd\.service'; then
-    systemctl restart lscpd || true
-  fi
-
+  # Restart panel service if present (often lscpd)
+  systemctl list-unit-files | grep -q '^lscpd\.service' && systemctl restart lscpd || true
   echo "[✓] Plugin installed"
 }
 
-# --- Non-interactive flags (optional) ---
+# ----- Args -----
 for arg in "$@"; do
   case "$arg" in
     --mode=cli) MODE="cli";;
@@ -115,7 +137,7 @@ Usage:
   install.sh [--mode=cli|--mode=with-plugin] [--panel-user=<user>]
 
 Examples:
-  # Interactive (prompt will appear)
+  # Interactive (prompt):
   bash install.sh
 
   # Non-interactive: CLI only
@@ -127,19 +149,17 @@ USAGE
       exit 0
       ;;
     *)
-      echo "[X] Unknown arg: $arg" >&2
-      exit 1
-      ;;
+      echo "[X] Unknown arg: $arg" >&2; exit 1;;
   esac
 done
 
-# --- Preflight ---
+# ----- Preflight -----
 need_root
 need_bin curl
 need_bin bash
 command -v visudo >/dev/null 2>&1 || { echo "[X] visudo missing"; exit 1; }
 
-# --- Interactive prompt if not provided ---
+# ----- Prompt if not specified -----
 if [[ -z "${MODE}" ]]; then
   echo "Select install mode:"
   echo "  1) CLI only"
@@ -153,13 +173,12 @@ if [[ -z "${MODE}" ]]; then
 fi
 echo "[i] Mode: ${MODE}"
 
-# --- Do it ---
+# ----- Do it -----
 install_cli
 write_sudoers
 [[ "${MODE}" == "with-plugin" ]] && install_plugin_from_repo
 
 echo
 echo "[✓] Done."
-echo "Quick tests:"
-echo "  sudo -u $(detect_panel_user) sudo -n ${CLI_PATH} --version"
-echo "  sudo -u $(detect_panel_user) sudo -n $(command -v systemctl) restart dotnet-EXAMPLE.com || true"
+echo "Open the plugin at: https://<server>:8090/pluginInstaller/${PLUGIN_NAME}/"
+echo "Or via CyberPanel sidebar → Plugins → CyberPanel .NET / SignalR"

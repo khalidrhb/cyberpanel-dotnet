@@ -32,15 +32,32 @@ sudo cyberpanel-dotnet deploy <domain>
 
 ## SignalR / WebSocket Support
 
+### Command syntax
+
+```
+sudo cyberpanel-dotnet signalr <domain> on [hubPaths...]
+sudo cyberpanel-dotnet signalr <domain> off
+```
+
+- Running `on` without hub paths → defaults to `/hub`.
+- You can pass one or more hub paths after `on`.
+
+
 By default, SignalR (WebSocket header forwarding) is **disabled**.  
 Enable it per site only if you use SignalR or another WebSocket-based feature.
 
 ```bash
-# Enable WebSocket header forwarding
-sudo cyberpanel-dotnet signalr <domain> on
+# Enable WebSocket header forwarding for default hub (/hub)
+sudo cyberpanel-dotnet signalr flezora.com on
 
-# Disable it again
-sudo cyberpanel-dotnet signalr <domain> off
+# Enable for a single custom hub
+sudo cyberpanel-dotnet signalr flezora.com on /ConnectionHub
+
+# Enable for multiple hubs
+sudo cyberpanel-dotnet signalr flezora.com on /hub /ConnectionHub /notifications
+
+# Disable it again (removes all SignalR contexts)
+sudo cyberpanel-dotnet signalr flezora.com off
 ```
 
 ## What it does

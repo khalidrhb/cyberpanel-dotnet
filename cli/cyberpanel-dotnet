@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.7"
+VERSION="1.0.8"
 
 usage() {
   cat <<'EOF'
-cyberpanel-dotnet v1.0.7
+cyberpanel-dotnet v1.0.8
 
 Usage:
   cyberpanel-dotnet enable <domain> --dll <MainDll>
   cyberpanel-dotnet deploy <domain> [--from <dir>]
   cyberpanel-dotnet toggle <domain> php|dotnet
   cyberpanel-dotnet disable <domain> [--purge]
-  cyberpanel-dotnet signalr <domain> on|off
+  cyberpanel-dotnet signalr <domain> on [hubPaths...]
+  cyberpanel-dotnet signalr <domain> off
   cyberpanel-dotnet --help | -h
   cyberpanel-dotnet --version
 
@@ -21,9 +22,11 @@ Notes:
 - Auto-port stored in: /home/<domain>/public_html/NetCoreApp/.dotnet-port
 - SignalR/WebSockets is OFF by default. Enable per site:
     sudo cyberpanel-dotnet signalr <domain> on
+- You can enable multiple hubs:
+    sudo cyberpanel-dotnet signalr <domain> on /hub /ConnectionHub /notifications
 - When SignalR is ON, we:
     * forward Upgrade/Connection + X-Forwarded-* headers
-    * add an explicit OpenLiteSpeed websocket context for /ConnectionHub
+    * add explicit OpenLiteSpeed websocket contexts for given hub paths
 EOF
 }
 
@@ -82,16 +85,15 @@ ensure_perms(){
 }
 
 # --------------- Include writers (canonical templates) ---------------
-# When WS=on we:
-#   - add header forwarding (Upgrade/Connection + X-Forwarded-*)
-#   - add explicit websocket context /ConnectionHub -> 127.0.0.1:<port>
 
 _write_dotnet_conf_file(){
-  # $1=dest_file  $2=port  $3=ws_flag ("on"|"off")
-  local dest="$1" ; local port="$2" ; local ws="$3"
+  # $1=dest_file  $2=port  $3=ws_flag ("on"|"off")  $4...=hub_paths
+  local dest="$1" ; local port="$2" ; local ws="$3" ; shift 3
+  local hub_paths=("$@")
 
   local ws_headers=""
   local ws_ctx=""
+
   if [[ "$ws" == "on" ]]; then
     ws_headers=$'  requestHeader set "Upgrade" "%{ENV:HTTP_UPGRADE}"\n'\
 $'  requestHeader set "Connection" "%{ENV:HTTP_CONNECTION}"\n'\
@@ -99,14 +101,23 @@ $'  requestHeader set "X-Forwarded-Proto" "https"\n'\
 $'  requestHeader set "X-Forwarded-Host"  "%{HTTP_HOST}"\n'\
 $'  requestHeader set "X-Forwarded-For"   "%{CLIENTIP}"'
 
-    ws_ctx=$(cat <<EOFCTX
-# WebSocket hub context (explicit mapping for /ConnectionHub)
-context /ConnectionHub {
+    # default hub path if none given
+    if [[ ${#hub_paths[@]} -eq 0 ]]; then
+      hub_paths=("/hub")
+    fi
+
+    for hp in "${hub_paths[@]}"; do
+      [[ "${hp:0:1}" != "/" ]] && hp="/$hp"
+      ws_ctx+=$(cat <<EOFCTX
+# WebSocket hub context for ${hp}
+context ${hp} {
   type                    websocket
   address                 127.0.0.1:${port}
 }
 EOFCTX
 )
+      ws_ctx+=$'\n'
+    done
   fi
 
   cat >"$dest" <<EOF
@@ -294,10 +305,9 @@ disable_cmd(){
   ok "Disabled .NET for ${domain} (purge=${purge})"
 }
 
-# --------------- SignalR/WebSocket toggle (safe & idempotent) ---------------
+# --------------- SignalR/WebSocket toggle (multi-hub) ---------------
 
 _get_port_from_include(){
-  # extract digits AFTER the colon in: address 127.0.0.1:<port>
   sed -n 's/.*address[[:space:]]\+127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$1" | head -n1
 }
 
@@ -309,35 +319,32 @@ _get_port_from_app(){
 
 signalr_cmd(){
   require_root
-  local domain="${1:-}"; local state="${2:-}"
-  [[ -n "$domain" && -n "$state" ]] || err "Usage: signalr <domain> on|off"
+  local domain="${1:-}"; local state="${2:-}"; shift 2
+  local hub_paths=("$@")
+
+  [[ -n "$domain" && -n "$state" ]] || err "Usage: signalr <domain> on|off [hubPaths...]"
 
   local inc_dir="/usr/local/lsws/conf/vhosts/${domain}/includes"
   local conf="${inc_dir}/dotnet-mode.conf"
   [[ -f "$conf" ]] || err "dotnet-mode.conf not found for ${domain} (run 'enable' first)."
 
-  # get port safely
   local port
   port="$(_get_port_from_include "$conf")"
   [[ -z "$port" ]] && port="$(_get_port_from_app "$domain")"
   [[ -n "$port" ]] || err "Unable to determine backend port for ${domain}."
 
-  # backup current include
   local backup="${conf}.bak.$(date +%s)"
   cp -a "$conf" "$backup"
 
-  # write a temp new file from the canonical template
   local tmp="${conf}.tmp.$$"
   case "$state" in
-    on)  _write_dotnet_conf_file "$tmp" "$port" "on"  ;;
+    on)  _write_dotnet_conf_file "$tmp" "$port" "on" "${hub_paths[@]}" ;;
     off) _write_dotnet_conf_file "$tmp" "$port" "off" ;;
     *)   err "Unknown state: $state (use on|off)";;
   esac
 
-  # atomic replace
   mv -f "$tmp" "$conf"
 
-  # restart OLS; if it fails, roll back
   if ! systemctl restart lsws; then
     echo "[X] OpenLiteSpeed restart failed. Restoring previous config..." >&2
     mv -f "$backup" "$conf" 2>/dev/null || true
@@ -346,6 +353,7 @@ signalr_cmd(){
   fi
 
   ok "SignalR/WebSocket headers ${state} for ${domain} (port ${port})"
+  [[ "$state" == "on" ]] && echo "[i] Hubs enabled: ${hub_paths[*]:-/hub}"
 }
 
 # ---------------- Main ----------------
@@ -359,7 +367,7 @@ main(){
     deploy)  shift; [[ $# -ge 1 ]] || err "deploy <domain> [--from <dir>]"; deploy_cmd "$@";;
     toggle)  shift; [[ $# -ge 2 ]] || err "toggle <domain> php|dotnet"; toggle_cmd "$@";;
     disable) shift; [[ $# -ge 1 ]] || err "disable <domain> [--purge]"; disable_cmd "$@";;
-    signalr) shift; [[ $# -ge 2 ]] || err "signalr <domain> on|off"; signalr_cmd "$@";;
+    signalr) shift; [[ $# -ge 2 ]] || err "signalr <domain> on|off [hubPaths...]"; signalr_cmd "$@";;
     *) usage; err "Unknown command: $1";;
   esac
 }

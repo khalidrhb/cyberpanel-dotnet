@@ -17,21 +17,17 @@ PANEL_USER="${PANEL_DEFAULT_USER}"
 # ===== Helpers =====
 need_root(){ [[ $EUID -eq 0 ]] || { echo "[X] Run with sudo"; exit 1; }; }
 need_bin(){ command -v "$1" >/dev/null 2>&1 || { echo "[X] Missing: $1"; exit 1; }; }
-have_file(){ [[ -f "$1" ]]; }
 have_dir(){ [[ -d "$1" ]]; }
 
 detect_panel_user(){
   if id -u "$PANEL_USER" >/dev/null 2>&1; then echo "$PANEL_USER"; return; fi
-  for u in lscpd cyberpanel www-data; do
-    id -u "$u" >/dev/null 2>&1 && { echo "$u"; return; }
-  done
+  for u in lscpd cyberpanel www-data; do id -u "$u" >/dev/null 2>&1 && { echo "$u"; return; }; done
   echo "$PANEL_DEFAULT_USER"
 }
 
 safe_write(){  # usage: curl ... | safe_write /path/to/file
   local file="$1" tmp="${file}.tmp.$$"
-  cat > "$tmp"
-  chmod 0644 "$tmp" || true
+  cat > "$tmp"; chmod 0644 "$tmp" || true
   [[ -f "$file" ]] && cp -a "$file" "${file}.bak.$(date +%s)" || true
   mv -f "$tmp" "$file"
 }
@@ -44,7 +40,6 @@ fetch_any(){  # fetch_any <dest> <relpath1> [relpath2] ...
     if curl -fsSL "$url" -o "$dest"; then ok=1; break; fi
   done
   [[ $ok -eq 1 ]] || { echo "[X] Failed to fetch: $*"; return 1; }
-  return 0
 }
 
 # ===== Installers =====
@@ -55,25 +50,13 @@ install_cli(){
     "scripts/cyberpanel-dotnet" \
     "cyberpanel-dotnet"
   chmod 0755 "${CLI_PATH}"
-
-  # Optional helpers if present in repo
-  for n in cyberpanel-dotnet-proxy cyberpanel-dotnet-wrapper dotnet-autodeploy; do
-    dest="/usr/local/bin/${n}"
-    if fetch_any "$dest" "cli/${n}" "scripts/${n}" "${n}" 2>/dev/null; then
-      chmod 0755 "$dest"
-      echo "[i] Installed helper: $n"
-    fi
-  done
-
   echo "[✓] CLI installed: $("${CLI_PATH}" --version || echo "version unknown")"
 }
 
 write_sudoers(){
-  local systemctl_bin
-  systemctl_bin="$(command -v systemctl || echo /usr/bin/systemctl)"
+  local systemctl_bin; systemctl_bin="$(command -v systemctl || echo /usr/bin/systemctl)"
   PANEL_USER="$(detect_panel_user)"
   echo "[i] Panel user: ${PANEL_USER}"
-
   cat > "${SUDOERS_FILE}" <<EOF
 ${PANEL_USER} ALL=(root) NOPASSWD: ${CLI_PATH} *
 ${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart dotnet-*
@@ -115,7 +98,6 @@ install_plugin_from_repo(){
     "$pybin" "${PLUGIN_ROOT}/pluginInstaller.py" install --pluginName "${PLUGIN_NAME}" || true
   fi
 
-  # Restart panel service if present (often lscpd)
   systemctl list-unit-files | grep -q '^lscpd\.service' && systemctl restart lscpd || true
   echo "[✓] Plugin installed"
 }
@@ -130,28 +112,14 @@ for arg in "$@"; do
       cat <<USAGE
 Usage:
   install.sh [--mode=cli|--mode=with-plugin] [--panel-user=<user>]
-
-Examples:
-  # Interactive (prompt):
-  bash install.sh
-
-  # Non-interactive: CLI only
-  bash install.sh --mode=cli --panel-user=lscpd
-
-  # Non-interactive: CLI + plugin
-  bash install.sh --mode=with-plugin --panel-user=lscpd
 USAGE
-      exit 0
-      ;;
-    *)
-      echo "[X] Unknown arg: $arg" >&2; exit 1;;
+      exit 0;;
+    *) echo "[X] Unknown arg: $arg" >&2; exit 1;;
   esac
 done
 
 # ===== Preflight =====
-need_root
-need_bin curl
-need_bin bash
+need_root; need_bin curl; need_bin bash
 command -v visudo >/dev/null 2>&1 || { echo "[X] visudo missing"; exit 1; }
 
 # ===== Interactive prompt (TTY-safe) =====
@@ -159,22 +127,16 @@ if [[ -z "${MODE}" ]]; then
   echo "Select install mode:"
   echo "  1) CLI only"
   echo "  2) CLI + CyberPanel plugin (UI)"
-
   choice=""
   if [ -t 0 ]; then
     read -rp "Enter choice [1-2] (default 2): " choice || true
   else
-    # stdin is a pipe; try real terminal
-    if [ -r /dev/tty ]; then
-      read -rp "Enter choice [1-2] (default 2): " choice < /dev/tty || true
-    fi
+    [ -r /dev/tty ] && read -rp "Enter choice [1-2] (default 2): " choice < /dev/tty || true
   fi
-
-  choice="${choice:-2}"
-  case "$choice" in
-    1) MODE="cli" ;;
-    2) MODE="with-plugin" ;;
-    *) MODE="with-plugin" ;;  # safe fallback
+  case "${choice:-2}" in
+    1) MODE="cli";;
+    2) MODE="with-plugin";;
+    *) MODE="with-plugin";;
   esac
 fi
 echo "[i] Mode: ${MODE}"
@@ -186,5 +148,7 @@ write_sudoers
 
 echo
 echo "[✓] Done."
-echo "Open the plugin at: https://<server>:8090/pluginInstaller/${PLUGIN_NAME}/"
-echo "Or via CyberPanel sidebar → Plugins → CyberPanel .NET / SignalR"
+if [[ "${MODE}" == "with-plugin" && -d "/usr/local/CyberCP" ]]; then
+  echo "Open the plugin at: https://<server>:8090/pluginInstaller/${PLUGIN_NAME}/"
+  echo "Or via CyberPanel sidebar → Plugins → CyberPanel .NET / SignalR"
+fi

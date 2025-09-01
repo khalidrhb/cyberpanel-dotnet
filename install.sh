@@ -25,18 +25,21 @@ detect_panel_user(){
   echo "$PANEL_DEFAULT_USER"
 }
 
-# read stdin -> temp file -> atomically move into place (backing up old)
-safe_write(){  # usage: curl ... | safe_write /path/to/file
+# Read stdin -> temp file -> atomic move (with backup)
+safe_write(){  # usage: curl ... | safe_write /absolute/path
   if [[ $# -ne 1 ]]; then echo "[X] safe_write requires destination path" >&2; return 1; fi
-  local file; file="$1"
-  local tmp;  tmp="${file}.tmp.$$"
+  local dest; dest="$1"
+  local dir;  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  local tmp;  tmp="$(mktemp "${dir}/.cpnet.XXXXXX")"
   cat > "$tmp"
   chmod 0644 "$tmp" || true
-  [[ -f "$file" ]] && cp -a "$file" "${file}.bak.$(date +%s)" || true
-  mv -f "$tmp" "$file"
+  [[ -f "$dest" ]] && cp -a "$dest" "${dest}.bak.$(date +%s)" || true
+  mv -f "$tmp" "$dest"
 }
 
-fetch_any(){  # fetch_any <dest> <relpath1> [relpath2] ...
+# fetch_any <dest> <relpath1> [relpath2] ...
+fetch_any(){
   local dest="$1"; shift
   local rel url ok=0
   for rel in "$@"; do
@@ -102,6 +105,7 @@ install_plugin_from_repo(){
     "$pybin" "${PLUGIN_ROOT}/pluginInstaller.py" install --pluginName "${PLUGIN_NAME}" || true
   fi
 
+  # Restart panel service if present (often lscpd)
   systemctl list-unit-files | grep -q '^lscpd\.service' && systemctl restart lscpd || true
   echo "[✓] Plugin installed"
 }

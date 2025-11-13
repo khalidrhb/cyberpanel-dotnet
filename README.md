@@ -1,3 +1,107 @@
+# 🚀 CyberPanel .NET — One-Command ASP.NET Core Hosting on CyberPanel/OpenLiteSpeed
+
+**Host ASP.NET Core apps on CyberPanel/OpenLiteSpeed in a single command.**  
+No manual vHost editing, no reverse-proxy headache, no confusion.  
+Full support for **.NET 6/7/8**, **SignalR**, **WebSockets**, and **multisite environments**.
+
+This tool gives you an IIS-like workflow on Linux + CyberPanel:
+- One-command enable
+- One-command deploy
+- PHP ↔ .NET toggle
+- SignalR + WebSockets support
+- Secure defaults
+- Automatic Kestrel service generation
+
+Everything is automated so you can deploy .NET applications without touching any OpenLiteSpeed configs manually.
+
+---
+
+## ⭐ Features
+
+### ✔️ One-command .NET Enable
+```bash
+sudo cyberpanel-dotnet enable <domain> --dll <YourMainDLL.dll>
+```
+Automatically:
+- Creates & configures the .NET reverse proxy  
+- Sets up Kestrel systemd service  
+- Updates OpenLiteSpeed vHost  
+- Blocks DLL/appsettings exposure  
+- Prepares application directory  
+- Detects free ports automatically  
+
+---
+
+### ✔️ Zero-downtime Deployment
+```bash
+sudo cyberpanel-dotnet deploy <domain>
+```
+Behaves like IIS “Publish”:
+- Stops previous instance  
+- Deploys new app  
+- Restarts smoothly  
+- Keeps per-domain logs  
+
+---
+
+### ✔️ PHP ↔ .NET Toggle
+```bash
+sudo cyberpanel-dotnet toggle <domain> php
+sudo cyberpanel-dotnet toggle <domain> dotnet
+```
+Instant switch for testing or rollback.
+
+---
+
+### ✔️ SignalR & WebSockets
+```bash
+sudo cyberpanel-dotnet signalr <domain> on --path "/hub"
+```
+Configures:
+- WebSocket passthrough  
+- Upgrade headers  
+- Keep-alive  
+- Multiple hub paths  
+
+---
+
+### ✔️ Safe Defaults
+- Blocks `.dll`, `pdb`, `appsettings*.json`
+- Disables autoIndex
+- Ensures directory permissions
+- Proper proxy headers for Kestrel
+
+---
+
+## 🔧 Installation
+
+```bash
+curl -s https://raw.githubusercontent.com/khalidrhb/cyberpanel-dotnet/main/install.sh | sudo bash
+```
+
+Check version:
+```bash
+cyberpanel-dotnet --version
+```
+
+---
+
+## 📦 Directory Flow
+
+```
+/home/<domain>/public_html/
+  ├─ NetCoreApp/
+  │  ├─ <MainDll>
+  │  ├─ appsettings.json
+  │  └─ wwwroot/
+  │     └─ uploads/   # Persistent, writable
+  └─ index.php        # Used only in PHP mode
+```
+
+---
+
+# 📘 Full Documentation (Advanced Users)
+
 # cyberpanel-dotnet
 
 One-command hosting for **ASP.NET Core** on **CyberPanel (OpenLiteSpeed)** with an IIS-like workflow.
@@ -41,7 +145,6 @@ sudo cyberpanel-dotnet signalr <domain> off
 
 - Running `on` without hub paths → defaults to `/hub`.
 - You can pass one or more hub paths after `on`.
-
 
 By default, SignalR (WebSocket header forwarding) is **disabled**.  
 Enable it per site only if you use SignalR or another WebSocket-based feature.
@@ -111,7 +214,7 @@ using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllersWithViews();
+builder.Services.addControllersWithViews();
 builder.Services.AddSignalR();
 
 var app = builder.Build();

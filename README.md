@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="CyberPanel.NET Logo" width="320">
+  <img src="assets/Logo.png" alt="CyberPanel.NET Logo" width="320">
 </p>
 
 # 🚀 CyberPanel .NET — One-Command ASP.NET Core Hosting on CyberPanel/OpenLiteSpeed
